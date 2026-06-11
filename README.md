@@ -170,6 +170,48 @@ stock_swing_tool/app.py
 
 デプロイが終わると、外出先のスマホからアクセスできるURLが発行されます。
 
+## Streamlit Cloudに変更が反映されないとき
+
+PCローカル版とStreamlit Cloud版のUIがズレている場合は、まずGitHubに最新commitがpushされているか確認します。
+
+```bash
+git status
+git log --oneline -3
+git fetch origin
+git status --short --branch
+```
+
+`main...origin/main` の後ろに `ahead` が出ている場合は、ローカルのcommitがGitHubへpushされていません。
+
+```bash
+git push origin main
+```
+
+GitHubへpush済みなのにCloud版が古い場合は、Streamlit Community Cloud側で再起動します。
+
+1. Streamlit Community Cloudで対象アプリを開きます。
+2. 右下または右上の `Manage app` を開きます。
+3. `Reboot app` を押します。
+4. それでも変わらない場合は、同じ画面から `Deploy` または `Redeploy` を実行します。
+5. `Logs` で最新commitが読み込まれているか、エラーが出ていないか確認します。
+
+Cloudの設定で確認する項目:
+
+- Repositoryが正しいGitHubリポジトリになっていること
+- Branchが `main` になっていること
+- Main file pathが、リポジトリ直下なら `app.py`、フォルダごと置いた場合は `stock_swing_tool/app.py` になっていること
+- Cloudのログで古いcommitではなく最新commitが使われていること
+
+スマホ側に古い画面キャッシュが残る場合があります。Cloudを更新した後は、スマホで以下も試してください。
+
+- ブラウザの更新ボタンを押す
+- URL末尾に `?v=2` のような適当なクエリを付けて開く
+- 別ブラウザで開く
+- シークレットモードまたはプライベートブラウズで開く
+- Streamlit画面右上のメニューから `Rerun` を押す
+
+最新UIでは、トップ画面には件数サマリーと案内文だけが表示され、買い候補カードは直接並びません。買い候補の詳細は `買い候補` タブ内の折りたたみを開いて確認します。
+
 ## Streamlit CloudのSecrets設定
 
 初期状態ではAPIキーなしで動きます。OpenAI APIを使いたい場合だけSecretsを設定してください。

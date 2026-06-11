@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+BUY_SCORE_THRESHOLD = 70
+WATCH_SCORE_THRESHOLD = 60
+
 THEME_KEYWORDS = ("AI", "防衛", "データセンター", "半導体", "電力", "宇宙", "電線")
 BUY_ENTRY_TYPES = ("押し目反発", "ブレイク狙い", "急落リバ")
 WATCH_ENTRY_TYPES = ("押し目待ち", "反発待ち", "ブレイク待ち", "地合い待ち", "出来高待ち")
@@ -171,9 +174,9 @@ def _risk_penalty(row: pd.Series) -> Tuple[int, List[str]]:
 
 
 def classify_score(score: int) -> str:
-    if score >= 70:
+    if score >= BUY_SCORE_THRESHOLD:
         return "買い候補"
-    if score >= 60:
+    if score >= WATCH_SCORE_THRESHOLD:
         return "監視"
     return "触らない"
 
