@@ -12,8 +12,8 @@ __pycache__/
 .ruff_cache/
 .coverage
 streamlit*.log
+alerts_log.csv
 .streamlit/secrets.toml
 secrets.toml
 .DS_Store
 Thumbs.db
-

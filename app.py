@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime
+import inspect
+from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, Iterable, List, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import DEFAULT_PRICE_PERIOD, TRADES_PATH
+from alert_builder import alert_key, append_alert_log, build_buy_candidate_discord_text, send_discord_webhook
+from config import ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, get_setting
+from data_fetcher import fetch_price_data, normalize_jp_symbol
+from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from notifier import format_yen
 from scanner import (
     append_trade_candidate,
@@ -69,24 +74,153 @@ COMPACT_COLUMNS = [
     "risk_reward",
 ]
 
+INTRADAY_TABLE_COLUMNS = [
+    "code",
+    "name",
+    "current_price",
+    "intraday_score",
+    "judgement",
+    "signal_type",
+    "buy_zone",
+    "stop_loss",
+    "take_profit_1",
+    "take_profit_2",
+    "reason",
+    "normalized_symbol",
+    "error_type",
+    "error_message",
+    "fetched_rows",
+    "last_attempt_at",
+]
 
-def _records_key(df: pd.DataFrame) -> Tuple[Tuple[str, str, str, str], ...]:
+PLOTLY_CHART_CONFIG = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+}
+DISCORD_BUY_SCORE_THRESHOLD = 70
+DISCORD_COOLDOWN_MINUTES = 30
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def _render_plotly_chart(fig: go.Figure, key: str) -> None:
+    width_kwargs: Dict[str, Any]
+    if "width" in inspect.signature(st.plotly_chart).parameters:
+        width_kwargs = {"width": "stretch"}
+    else:
+        width_kwargs = {"use_container_width": True}
+    st.plotly_chart(fig, config=PLOTLY_CHART_CONFIG, key=key, **width_kwargs)
+
+
+def _now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def _is_jpx_market_time(now: datetime | None = None) -> bool:
+    current = now or _now_jst()
+    if current.weekday() >= 5:
+        return False
+    current_time = current.time()
+    morning = dt_time(9, 0) <= current_time <= dt_time(11, 30)
+    afternoon = dt_time(12, 30) <= current_time <= dt_time(15, 30)
+    return morning or afternoon
+
+
+def _intraday_score(signal: Dict[str, Any]) -> int:
+    try:
+        return int(float(signal.get("intraday_score", signal.get("score", 0)) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _notification_symbol(signal: Dict[str, Any]) -> str:
+    return str(signal.get("normalized_symbol") or signal.get("code") or "").strip()
+
+
+def _is_discord_buy_candidate(signal: Dict[str, Any]) -> bool:
+    judgement = str(signal.get("judgement") or "")
+    category = str(signal.get("category") or "")
+    return (
+        _intraday_score(signal) >= DISCORD_BUY_SCORE_THRESHOLD
+        and (judgement in {"買い検討OK", "買い候補"} or category == "買い候補")
+    )
+
+
+def _parse_state_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=JST)
+    except ValueError:
+        return None
+
+
+def _notification_cooldown_elapsed(last_sent_at: datetime | None, now: datetime) -> bool:
+    if last_sent_at is None:
+        return True
+    return now - last_sent_at >= timedelta(minutes=DISCORD_COOLDOWN_MINUTES)
+
+
+def _format_jst(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_display_datetime(value: Any) -> datetime | None:
+    if not value or value == "-":
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+    except ValueError:
+        return None
+
+
+def _next_check_text(auto_monitor_enabled: bool, refresh_seconds: int) -> str:
+    if not auto_monitor_enabled:
+        return "-"
+    last_checked_at = _parse_display_datetime(st.session_state.get("intraday_last_checked_at", "-"))
+    if last_checked_at is None:
+        return f"{refresh_seconds}秒以内"
+    return _format_jst(last_checked_at + timedelta(seconds=refresh_seconds))
+
+
+def _recently_checked(min_seconds: int = 5) -> bool:
+    last_checked_at = _parse_display_datetime(st.session_state.get("intraday_last_checked_at", "-"))
+    if last_checked_at is None:
+        return False
+    return (_now_jst() - last_checked_at) < timedelta(seconds=min_seconds)
+
+
+def _records_key(df: pd.DataFrame) -> Tuple[Tuple[str, str, str, str, str, str], ...]:
     return tuple(
-        (str(row.code), str(row.name), str(row.theme), str(row.market))
+        (
+            str(getattr(row, "code", "")),
+            str(getattr(row, "name", "")),
+            str(getattr(row, "theme", "")),
+            str(getattr(row, "market", "")),
+            str(getattr(row, "raw_code", "")),
+            str(getattr(row, "normalized_symbol", "")),
+        )
         for row in df.itertuples(index=False)
     )
 
 
-def _records_from_key(records_key: Tuple[Tuple[str, str, str, str], ...]) -> List[Dict[str, str]]:
+def _records_from_key(records_key: Tuple[Tuple[str, str, str, str, str, str], ...]) -> List[Dict[str, str]]:
     return [
-        {"code": code, "name": name, "theme": theme, "market": market}
-        for code, name, theme, market in records_key
+        {
+            "code": code,
+            "name": name,
+            "theme": theme,
+            "market": market,
+            "raw_code": raw_code,
+            "normalized_symbol": normalized_symbol,
+        }
+        for code, name, theme, market, raw_code, normalized_symbol in records_key
     ]
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _scan_cached(
-    records_key: Tuple[Tuple[str, str, str, str], ...],
+    records_key: Tuple[Tuple[str, str, str, str, str, str], ...],
     period: str,
     refresh_token: int,
 ) -> List[Dict[str, Any]]:
@@ -177,6 +311,44 @@ def _score_breakdown_chart(signal: Dict[str, Any]) -> go.Figure:
     return fig
 
 
+def _make_intraday_chart(signal: Dict[str, Any]) -> go.Figure:
+    df = signal.get("data")
+    fig = go.Figure()
+    if df is None or getattr(df, "empty", True):
+        fig.update_layout(height=260, margin=dict(l=8, r=8, t=28, b=8))
+        return fig
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="5分足",
+            increasing_line_color="#dc2626",
+            decreasing_line_color="#2563eb",
+        )
+    )
+    for col, color, label in [
+        ("ma_short", "#f59e0b", "短期線"),
+        ("ma_mid", "#059669", "中期線"),
+        ("ma_long", "#6b7280", "長期線"),
+    ]:
+        if col in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=label, line=dict(color=color, width=1.4)))
+    level = signal.get("level_price")
+    if level:
+        fig.add_hline(y=level, line_dash="dot", line_color="#7c3aed", annotation_text=f"節目 {format_yen(level)}")
+    fig.update_layout(
+        height=310,
+        margin=dict(l=8, r=8, t=28, b=8),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for signal in signals:
@@ -192,6 +364,124 @@ def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows, columns=COMPACT_COLUMNS)
+
+
+def _parse_manual_codes(raw_text: str) -> List[str]:
+    if not raw_text.strip():
+        return []
+    normalized = raw_text.replace(",", " ").replace("\n", " ")
+    return [part.strip().replace(".T", "") for part in normalized.split() if part.strip()]
+
+
+def _build_intraday_targets(
+    watchlist: pd.DataFrame,
+    buy: List[Dict[str, Any]],
+    watch: List[Dict[str, Any]],
+    manual_codes: List[str],
+    include_watchlist: bool,
+    include_swing_focus: bool,
+) -> List[Dict[str, Any]]:
+    records: Dict[str, Dict[str, Any]] = {}
+
+    def add_record(code: Any, name: Any = "", theme: Any = "", market: Any = "", raw_code: Any = "") -> None:
+        normalized_symbol = normalize_jp_symbol(code)
+        if not normalized_symbol:
+            return
+        normalized = normalized_symbol.replace(".T", "")
+        if normalized not in records:
+            records[normalized] = {
+                "code": normalized,
+                "name": str(name or normalized),
+                "theme": str(theme or ""),
+                "market": str(market or ""),
+                "raw_code": str(raw_code or code or ""),
+                "normalized_symbol": normalized_symbol,
+            }
+
+    if include_watchlist and not watchlist.empty:
+        for row in watchlist.to_dict("records"):
+            add_record(
+                row.get("normalized_symbol") or row.get("code"),
+                row.get("name"),
+                row.get("theme"),
+                row.get("market"),
+                row.get("raw_code") or row.get("code"),
+            )
+
+    if include_swing_focus:
+        for signal in buy + watch:
+            add_record(
+                signal.get("normalized_symbol") or signal.get("code"),
+                signal.get("name"),
+                signal.get("theme"),
+                signal.get("market"),
+                signal.get("raw_code") or signal.get("code"),
+            )
+
+    for code in manual_codes:
+        add_record(code)
+
+    return list(records.values())
+
+
+def _intraday_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for signal in signals:
+        rows.append(
+            {
+                "code": signal.get("code", ""),
+                "name": signal.get("name", ""),
+                "current_price": format_yen(signal.get("current_price")),
+                "intraday_score": signal.get("intraday_score", 0),
+                "judgement": signal.get("judgement", "-"),
+                "signal_type": signal.get("signal_type", "-"),
+                "buy_zone": signal.get("buy_zone", "-"),
+                "stop_loss": format_yen(signal.get("stop_loss")),
+                "take_profit_1": format_yen(signal.get("take_profit_1")),
+                "take_profit_2": format_yen(signal.get("take_profit_2")),
+                "reason": "、".join(signal.get("reasons", [])) if signal.get("reasons") else signal.get("error", "-"),
+                "normalized_symbol": signal.get("normalized_symbol", ""),
+                "error_type": signal.get("error_type", ""),
+                "error_message": signal.get("error_message", signal.get("error", "")),
+                "fetched_rows": signal.get("fetched_rows", ""),
+                "last_attempt_at": signal.get("last_attempt_at", ""),
+            }
+        )
+    return pd.DataFrame(rows, columns=INTRADAY_TABLE_COLUMNS)
+
+
+def _failure_debug_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for signal in signals:
+        rows.append(
+            {
+                "code": signal.get("raw_code") or signal.get("code", ""),
+                "normalized_symbol": signal.get("normalized_symbol", ""),
+                "error_type": signal.get("error_type", ""),
+                "error_message": signal.get("error_message", signal.get("error", signal.get("comment", ""))),
+                "fetched_rows": signal.get("fetched_rows", 0),
+                "last_attempt_at": signal.get("last_attempt_at", ""),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=["code", "normalized_symbol", "error_type", "error_message", "fetched_rows", "last_attempt_at"],
+    )
+
+
+def _render_failure_debug(signals: List[Dict[str, Any]], title: str = "取得失敗の理由") -> None:
+    if not signals:
+        return
+    with st.expander(title, expanded=True):
+        st.dataframe(_failure_debug_table(signals), width="stretch", hide_index=True)
+
+
+def _render_all_failed_warning(signals: List[Dict[str, Any]]) -> None:
+    if not signals:
+        return
+    st.error("全銘柄の取得に失敗しています。銘柄コード形式、yfinance接続、watchlist.csvの形式を確認してください。")
+    st.caption("デバッグ用に最初の5件だけ表示します。")
+    st.dataframe(_failure_debug_table(signals).head(5), width="stretch", hide_index=True)
 
 
 def _render_count_metrics(
@@ -253,8 +543,8 @@ def _render_detail_content(signal: Dict[str, Any], key_prefix: str, show_chart: 
     if show_chart:
         chart_key = f"price_chart_{key_prefix}_{signal.get('code')}"
         score_key = f"score_chart_{key_prefix}_{signal.get('code')}"
-        st.plotly_chart(_make_price_chart(signal), width="stretch", key=chart_key)
-        st.plotly_chart(_score_breakdown_chart(signal), width="stretch", key=score_key)
+        _render_plotly_chart(_make_price_chart(signal), key=chart_key)
+        _render_plotly_chart(_score_breakdown_chart(signal), key=score_key)
 
     st.text_area(
         "ChatGPTへ貼り付ける通知文",
@@ -356,7 +646,405 @@ def _render_details_tab(
     _render_signal_expanders(avoid, key_prefix="detail_avoid", show_chart=True)
     if failed:
         st.subheader("取得失敗")
-        st.dataframe(build_signal_table(failed), width="stretch", hide_index=True)
+        _render_failure_debug(failed, "取得失敗の理由")
+        with st.expander("取得失敗の詳細一覧", expanded=False):
+            st.dataframe(build_signal_table(failed), width="stretch", hide_index=True)
+
+
+def _render_intraday_signal(signal: Dict[str, Any], key_prefix: str) -> None:
+    if signal.get("judgement") == "取得失敗":
+        st.warning(signal.get("error_message") or signal.get("error") or "場中データ取得に失敗しました。")
+        st.dataframe(_failure_debug_table([signal]), width="stretch", hide_index=True)
+        return
+
+    cols = st.columns(3)
+    cols[0].metric("現在値", format_yen(signal.get("current_price")))
+    cols[1].metric("場中スコア", f"{signal.get('intraday_score', 0)}点")
+    cols[2].metric("判定", signal.get("judgement", "-"))
+
+    cols = st.columns(3)
+    cols[0].metric("買い候補", signal.get("buy_zone", "-"))
+    cols[1].metric("損切り", format_yen(signal.get("stop_loss")))
+    cols[2].metric("利確", f"{format_yen(signal.get('take_profit_1'))} / {format_yen(signal.get('take_profit_2'))}")
+
+    st.markdown(f"**狙い**：{signal.get('signal_type', '-')}")
+    st.markdown(f"**最終足**：{signal.get('last_time', '-')}")
+    st.markdown(
+        f"**節目**：{format_yen(signal.get('level_price'))} / "
+        f"突破: {signal.get('level_breakout', False)} / 維持: {signal.get('level_hold', False)}"
+    )
+    st.markdown(
+        f"**5分足状態**：短期 {format_yen(signal.get('ma_short'))} / "
+        f"中期 {format_yen(signal.get('ma_mid'))} / 長期 {format_yen(signal.get('ma_long'))}"
+    )
+    st.markdown(
+        f"**出来高**：{signal.get('current_volume', 0):,} / "
+        f"平均 {signal.get('volume_avg', 0):,} / 倍率 {signal.get('volume_ratio', '-')}"
+    )
+    st.markdown(
+        f"**当日レンジ**：高値 {format_yen(signal.get('day_high'))} / "
+        f"安値 {format_yen(signal.get('day_low'))} / 安値から {signal.get('rebound_from_day_low_pct', 0)}%"
+    )
+    st.markdown(f"**RSI**：{signal.get('rsi', '-')}")
+
+    _render_reason_list("判定理由", signal.get("reasons"))
+    _render_reason_list("見送り・警戒理由", signal.get("risk_notes"))
+    _render_reason_list("買ってはいけない条件", signal.get("no_buy_conditions"))
+
+    _render_plotly_chart(_make_intraday_chart(signal), key=f"intraday_chart_{key_prefix}_{signal.get('code')}")
+    st.text_area(
+        "通知文",
+        value=signal.get("notification_text", ""),
+        height=220,
+        key=f"intraday_note_{key_prefix}_{signal.get('code')}",
+    )
+
+
+def _render_intraday_section(title: str, signals: List[Dict[str, Any]], key_prefix: str) -> None:
+    st.subheader(f"{title}（{len(signals)}件）")
+    if not signals:
+        st.info("該当銘柄はありません。")
+        return
+    for idx, signal in enumerate(signals):
+        label = (
+            f"{signal.get('code')} {signal.get('name')}｜{signal.get('intraday_score', 0)}点"
+            f"｜{signal.get('judgement', '-')}｜{signal.get('signal_type', '-')}"
+        )
+        with st.expander(label, expanded=False):
+            _render_intraday_signal(signal, key_prefix=f"{key_prefix}_{idx}")
+
+
+def _process_intraday_notifications(signals: List[Dict[str, Any]], discord_enabled: bool) -> None:
+    if "intraday_notified_keys" not in st.session_state:
+        st.session_state.intraday_notified_keys = []
+    if "discord_last_notified_by_symbol" not in st.session_state:
+        st.session_state.discord_last_notified_by_symbol = {}
+    if "discord_initial_suppressed_at_by_symbol" not in st.session_state:
+        st.session_state.discord_initial_suppressed_at_by_symbol = {}
+
+    now = _now_jst()
+    notified = set(st.session_state.intraday_notified_keys)
+    missing_webhook_warned = False
+    market_time_warned = False
+    webhook_configured = bool(get_setting("DISCORD_WEBHOOK_URL", "").strip())
+    is_market_time = _is_jpx_market_time(now)
+    current_candidate_symbols = {
+        _notification_symbol(signal)
+        for signal in signals
+        if _is_discord_buy_candidate(signal) and _notification_symbol(signal)
+    }
+    previous_candidate_symbols_raw = st.session_state.get("discord_previous_buy_candidate_symbols")
+    first_candidate_scan = previous_candidate_symbols_raw is None
+    previous_candidate_symbols = set(previous_candidate_symbols_raw or [])
+    last_notified_by_symbol = dict(st.session_state.discord_last_notified_by_symbol)
+    initial_suppressed_by_symbol = dict(st.session_state.discord_initial_suppressed_at_by_symbol)
+
+    for signal in signals:
+        if signal.get("judgement") not in {"買い検討OK", "監視強化"}:
+            continue
+
+        key = alert_key(signal)
+        is_new_screen_alert = key not in notified
+        discord_status = "disabled" if not discord_enabled else ""
+        discord_error = ""
+        discord_attempted = False
+
+        if is_new_screen_alert:
+            message = (
+                f"{signal.get('code')} {signal.get('name')} "
+                f"{signal.get('judgement')} / {signal.get('intraday_score')}点"
+            )
+            if signal.get("judgement") == "買い検討OK":
+                st.toast(message)
+                st.success(message)
+            else:
+                st.toast(message)
+                st.warning(message)
+            notified.add(key)
+
+        if discord_enabled and _is_discord_buy_candidate(signal):
+            symbol = _notification_symbol(signal)
+            if not symbol:
+                discord_status = "skipped_no_symbol"
+            elif first_candidate_scan:
+                discord_status = "initial_suppressed"
+                initial_suppressed_by_symbol.setdefault(symbol, now.isoformat())
+            elif not webhook_configured:
+                discord_status = "skipped_no_webhook"
+                st.session_state.discord_last_status = "スキップ"
+                st.session_state.discord_last_error = "Webhook設定がないため通知をスキップしました。"
+                if not missing_webhook_warned:
+                    st.warning("Webhook設定がないためDiscord通知をスキップしました。")
+                    missing_webhook_warned = True
+            elif not is_market_time:
+                discord_status = "skipped_market_closed"
+                st.session_state.discord_last_status = "市場時間外"
+                st.session_state.discord_last_error = ""
+                if not market_time_warned:
+                    st.caption("市場時間外のため、本番Discord通知はスキップしました。テスト通知は送信できます。")
+                    market_time_warned = True
+            else:
+                is_new_candidate = symbol not in previous_candidate_symbols
+                last_sent_at = _parse_state_datetime(last_notified_by_symbol.get(symbol))
+                initial_suppressed_at = _parse_state_datetime(initial_suppressed_by_symbol.get(symbol))
+                cooldown_ok = last_sent_at is not None and _notification_cooldown_elapsed(last_sent_at, now)
+                initial_suppressed_elapsed = (
+                    last_sent_at is None
+                    and initial_suppressed_at is not None
+                    and _notification_cooldown_elapsed(initial_suppressed_at, now)
+                )
+                should_send_discord = is_new_candidate or cooldown_ok or initial_suppressed_elapsed
+                if not should_send_discord:
+                    discord_status = "skipped_cooldown"
+                else:
+                    discord_attempted = True
+                    ok, error = send_discord_webhook(build_buy_candidate_discord_text(signal))
+                    st.session_state.discord_last_notified_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                    if ok:
+                        discord_status = "success"
+                        last_notified_by_symbol[symbol] = now.isoformat()
+                        st.session_state.discord_last_status = "成功"
+                        st.session_state.discord_last_error = ""
+                        st.success(f"Discordへ買い候補を通知しました: {signal.get('code')} {signal.get('name')}")
+                    else:
+                        discord_status = "failed"
+                        discord_error = error
+                        st.session_state.discord_last_status = "失敗"
+                        st.session_state.discord_last_error = error
+                        st.warning(error)
+
+        if is_new_screen_alert or discord_attempted:
+            try:
+                append_alert_log(signal, discord_sent=discord_status, discord_error=discord_error)
+            except Exception as exc:
+                st.caption(f"alerts_log.csvへ保存できませんでした: {exc}")
+
+    st.session_state.intraday_notified_keys = sorted(notified)
+    st.session_state.discord_previous_buy_candidate_symbols = sorted(current_candidate_symbols)
+    st.session_state.discord_last_notified_by_symbol = last_notified_by_symbol
+    st.session_state.discord_initial_suppressed_at_by_symbol = initial_suppressed_by_symbol
+
+
+def _render_alerts_log() -> None:
+    with st.expander("通知履歴 alerts_log.csv", expanded=False):
+        if not ALERTS_LOG_PATH.exists():
+            st.info("通知履歴はまだありません。")
+            return
+        try:
+            log_df = pd.read_csv(ALERTS_LOG_PATH, dtype={"code": str}).fillna("")
+        except Exception as exc:
+            st.warning(f"通知履歴を読み込めませんでした: {exc}")
+            return
+        if log_df.empty:
+            st.info("通知履歴はまだありません。")
+        else:
+            st.dataframe(log_df.tail(100).iloc[::-1], width="stretch", hide_index=True)
+
+
+def _render_fetch_test() -> None:
+    with st.expander("取得テスト", expanded=False):
+        test_code = st.text_input("取得テストコード", value="5803", key="fetch_test_code")
+        if not st.button("取得テスト", key="fetch_test_button"):
+            return
+
+        symbol = normalize_jp_symbol(test_code)
+        with st.spinner("yfinance取得テスト中です..."):
+            daily = fetch_price_data(test_code, period="6mo", interval="1d")
+            intraday = fetch_intraday_data(test_code, interval="5m", period="5d")
+
+        latest_close = "-"
+        if not intraday.data.empty:
+            latest_close = format_yen(intraday.data["Close"].iloc[-1])
+        elif not daily.data.empty:
+            latest_close = format_yen(daily.data["Close"].iloc[-1])
+
+        error_messages = []
+        if daily.error:
+            error_messages.append(f"日足: {daily.error_message or daily.error}")
+        if intraday.error:
+            error_messages.append(f"5分足: {intraday.error_message or intraday.error}")
+
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "入力コード": test_code,
+                        "yfinance用シンボル": symbol,
+                        "日足取得行数": daily.fetched_rows,
+                        "5分足取得行数": intraday.fetched_rows,
+                        "最新Close": latest_close,
+                        "エラー": " / ".join(error_messages) if error_messages else "-",
+                    }
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _run_intraday_scan(
+    targets: List[Dict[str, Any]],
+    interval: str,
+    discord_enabled: bool,
+    source_label: str,
+) -> None:
+    if not targets:
+        st.session_state.intraday_results = []
+        st.session_state.intraday_last_scan_status = "監視対象なし"
+        st.warning("監視対象がありません。watchlist.csvまたは手動入力コードを確認してください。")
+        return
+
+    with st.spinner(f"{source_label}で5分足データを取得して場中エントリー条件を判定中です..."):
+        st.session_state.intraday_results = scan_intraday_entries(targets, interval=interval, period="5d")
+        checked_at = _format_jst(_now_jst())
+        st.session_state.intraday_last_updated = checked_at
+        st.session_state.intraday_last_checked_at = checked_at
+        st.session_state.intraday_last_scan_status = f"{len(targets)}銘柄チェック完了"
+    _process_intraday_notifications(st.session_state.intraday_results, discord_enabled=discord_enabled)
+
+
+def _render_intraday_tab(
+    watchlist: pd.DataFrame,
+    buy: List[Dict[str, Any]],
+    watch: List[Dict[str, Any]],
+) -> None:
+    st.subheader("場中エントリー監視")
+    st.caption("5分足で、場中に買える形になった銘柄を検知します。自動売買は行いません。")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        interval = st.selectbox("足種", ["5m", "1m"], index=0)
+        include_watchlist = st.checkbox("watchlist.csv全銘柄を対象", value=True)
+    with col_b:
+        include_swing_focus = st.checkbox("買い候補・監視銘柄を対象に含める", value=True)
+        auto_refresh = st.toggle("自動監視ON/OFF", value=True)
+
+    refresh_seconds = st.selectbox("監視間隔", [60, 120, 300], index=0, format_func=lambda value: f"{value}秒")
+    manual_codes_text = st.text_area("手動入力コード（任意、カンマ・空白・改行区切り）", placeholder="例: 5803, 3774, 6501")
+    manual_codes = _parse_manual_codes(manual_codes_text)
+
+    _render_fetch_test()
+
+    if "discord_last_notified_at" not in st.session_state:
+        st.session_state.discord_last_notified_at = "-"
+    if "discord_last_status" not in st.session_state:
+        st.session_state.discord_last_status = "未送信"
+    if "discord_last_error" not in st.session_state:
+        st.session_state.discord_last_error = ""
+
+    st.markdown("**Discord通知**")
+    webhook_configured = bool(get_setting("DISCORD_WEBHOOK_URL", "").strip())
+    mention_configured = bool(get_setting("DISCORD_MENTION_ID", "").strip())
+    st.caption(f"Webhook設定：{'あり' if webhook_configured else 'なし'}")
+    st.caption(f"メンション設定：{'あり' if mention_configured else 'なし'}")
+    st.caption("本番通知対象：市場時間内の買い検討OK・70点以上のみ。同一銘柄は30分クールダウン。")
+    discord_cols = st.columns(2)
+    with discord_cols[0]:
+        discord_enabled = st.checkbox("Discord通知ON/OFF", value=webhook_configured)
+    with discord_cols[1]:
+        test_discord_clicked = st.button("テスト通知")
+
+    if test_discord_clicked:
+        test_message = "\n".join(
+            [
+                "【テスト通知】",
+                "stock_swing_tool からDiscord通知テストです。",
+                "このメッセージが届けばWebhook設定OKです。",
+            ]
+        )
+        ok, error = send_discord_webhook(test_message)
+        st.session_state.discord_last_notified_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if ok:
+            st.session_state.discord_last_status = "成功"
+            st.session_state.discord_last_error = ""
+            st.success("Discordテスト通知を送信しました。")
+        else:
+            st.session_state.discord_last_status = "失敗"
+            st.session_state.discord_last_error = error
+            st.warning(error)
+
+    status_text = f"通知状態: {st.session_state.discord_last_status}"
+    if st.session_state.discord_last_error:
+        status_text += f"（{st.session_state.discord_last_error}）"
+    st.caption(f"最終Discord通知時刻: {st.session_state.discord_last_notified_at}")
+    st.caption(status_text)
+
+    targets = _build_intraday_targets(
+        watchlist=watchlist,
+        buy=buy,
+        watch=watch,
+        manual_codes=manual_codes,
+        include_watchlist=include_watchlist,
+        include_swing_focus=include_swing_focus,
+    )
+    st.caption(f"今回の監視対象: {len(targets)}銘柄")
+
+    update_clicked = st.button("場中データを更新", type="primary")
+    should_scan = update_clicked
+
+    if "intraday_results" not in st.session_state:
+        st.session_state.intraday_results = []
+    if "intraday_last_updated" not in st.session_state:
+        st.session_state.intraday_last_updated = "-"
+    if "intraday_last_checked_at" not in st.session_state:
+        st.session_state.intraday_last_checked_at = "-"
+    if "intraday_last_scan_status" not in st.session_state:
+        st.session_state.intraday_last_scan_status = "未チェック"
+
+    status_cols = st.columns(5)
+    status_cols[0].metric("自動監視", "ON" if auto_refresh else "OFF")
+    status_cols[1].metric("監視間隔", f"{refresh_seconds}秒")
+    status_cols[2].metric("最終チェック", st.session_state.intraday_last_checked_at)
+    status_cols[3].metric("次回チェック目安", _next_check_text(auto_refresh, int(refresh_seconds)))
+    status_cols[4].metric("Discord通知", "ON" if discord_enabled else "OFF")
+    st.caption(
+        "PCスリープ中、Streamlit停止中、またはブラウザを閉じている場合は自動監視できません。"
+        "ブラウザでこのアプリを開いている間だけ動作します。"
+    )
+    st.caption(f"監視状態：{st.session_state.intraday_last_scan_status}")
+
+    if should_scan:
+        _run_intraday_scan(targets, interval=interval, discord_enabled=discord_enabled, source_label="手動更新")
+
+    if auto_refresh:
+        @st.fragment(run_every=timedelta(seconds=int(refresh_seconds)))
+        def _auto_intraday_scan_fragment() -> None:
+            if _recently_checked():
+                return
+            _run_intraday_scan(targets, interval=interval, discord_enabled=discord_enabled, source_label="自動監視")
+            st.rerun()
+
+        _auto_intraday_scan_fragment()
+
+    st.markdown(f"**最終更新**：{st.session_state.intraday_last_updated}")
+    results = list(st.session_state.intraday_results)
+    ok = [s for s in results if s.get("judgement") == "買い検討OK"]
+    strong_watch = [s for s in results if s.get("judgement") == "監視強化"]
+    skip = [s for s in results if s.get("judgement") == "見送り"]
+    failed = [s for s in results if s.get("judgement") == "取得失敗"]
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("買い検討OK", len(ok))
+    metric_cols[1].metric("監視強化", len(strong_watch))
+    metric_cols[2].metric("見送り", len(skip))
+    metric_cols[3].metric("取得失敗", len(failed))
+
+    if results and len(failed) == len(results):
+        _render_all_failed_warning(failed)
+
+    _render_intraday_section("買い検討OK", ok, "intraday_ok")
+    _render_intraday_section("監視強化", strong_watch, "intraday_watch")
+    _render_intraday_section("見送り", skip, "intraday_skip")
+    if failed:
+        _render_intraday_section("取得失敗・データ不足", failed, "intraday_failed")
+
+    with st.expander("PC向け一覧表", expanded=False):
+        if results:
+            st.dataframe(_intraday_table(results), width="stretch", hide_index=True)
+        else:
+            st.info("更新ボタンを押すと一覧を表示します。")
+
+    _render_alerts_log()
 
 
 def _render_trades() -> None:
@@ -394,7 +1082,11 @@ def main() -> None:
         watchlist = load_watchlist()
     except Exception as exc:
         st.error(f"watchlist.csvを読み込めませんでした: {exc}")
-        return
+        watchlist = pd.DataFrame(columns=["code", "name", "theme", "market", "raw_code", "normalized_symbol"])
+
+    watchlist_error = watchlist.attrs.get("load_error", "")
+    if watchlist_error:
+        st.warning(watchlist_error)
 
     with st.spinner("株価取得とスコア計算を実行中です..."):
         signals = _scan_cached(_records_key(watchlist), period, st.session_state.refresh_token)
@@ -403,16 +1095,19 @@ def main() -> None:
 
     _render_count_metrics(buy, watch, avoid, failed)
     st.info("買い候補は下のタブから確認してください。トップ画面には詳細カードを表示していません。")
+    if signals and len(failed) == len(signals):
+        _render_all_failed_warning(failed)
 
     (
         tab_summary,
         tab_buy,
         tab_watch,
         tab_avoid,
+        tab_intraday,
         tab_details,
         tab_watchlist,
         tab_trades,
-    ) = st.tabs(["サマリー", "買い候補", "監視", "触らない", "詳細分析", "監視リスト", "検証結果"])
+    ) = st.tabs(["サマリー", "買い候補", "監視", "触らない", "場中エントリー監視", "詳細分析", "監視リスト", "検証結果"])
 
     with tab_summary:
         _render_summary_tab(buy, watch, avoid, failed)
@@ -425,6 +1120,9 @@ def main() -> None:
 
     with tab_avoid:
         _render_avoid_tab(avoid)
+
+    with tab_intraday:
+        _render_intraday_tab(watchlist, buy, watch)
 
     with tab_details:
         _render_details_tab(buy, watch, avoid, failed)

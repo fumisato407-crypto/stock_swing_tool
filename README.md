@@ -19,6 +19,9 @@ stock_swing_tool/
 ├─ data_fetcher.py
 ├─ indicators.py
 ├─ scoring.py
+├─ intraday_scanner.py
+├─ entry_rules.py
+├─ alert_builder.py
 ├─ ai_judge.py
 ├─ notifier.py
 ├─ backtest.py
@@ -214,7 +217,7 @@ Cloudの設定で確認する項目:
 
 ## Streamlit CloudのSecrets設定
 
-初期状態ではAPIキーなしで動きます。OpenAI APIを使いたい場合だけSecretsを設定してください。
+初期状態ではAPIキーなしで動きます。OpenAI APIやDiscord通知を使いたい場合だけSecretsを設定してください。
 
 Streamlit Cloudのアプリ画面で以下を開きます。
 
@@ -230,10 +233,16 @@ OPENAI_MODEL = "gpt-4o-mini"
 JQUANTS_EMAIL = ""
 JQUANTS_PASSWORD = ""
 NOTIFICATION_CHANNEL = "console"
-PRICE_PERIOD = "9mo"
+DISCORD_WEBHOOK_URL = ""
+DISCORD_MENTION_ID = ""
+PRICE_PERIOD = "6mo"
 ```
 
 OpenAI APIを使う場合は、`OPENAI_API_KEY`に実際のキーを入れます。使わない場合は空欄のままで構いません。
+
+Discord通知を使う場合は、`DISCORD_WEBHOOK_URL`にDiscordのWebhook URLを入れます。Webhook URLはPythonファイル、README、CSVには直接書かず、ローカルでは`.env`、Streamlit CloudではSecretsにだけ保存してください。
+
+スマホで通知に気づきやすくしたい場合は、任意で`DISCORD_MENTION_ID`にDiscordユーザーIDを入れます。空欄ならメンションなしで送信します。ID本体は画面やログに表示しません。
 
 Secretsに入れた値はGitHubには保存されません。GitHubのREADME、CSV、PythonファイルへAPIキーを直接書かないでください。
 
@@ -252,8 +261,92 @@ Secretsに入れた値はGitHubには保存されません。GitHubのREADME、C
 - 監視銘柄の「何待ちか」をカード形式で確認
 - 銘柄ごとのスコア、買い条件、損切り、利確目安、期待値を確認
 - チャートとスコア内訳を確認
+- 場中の5分足から「買い検討OK」「監視強化」「見送り」を確認
+- 取得失敗時に正規化後シンボル、エラー種別、取得行数を確認
 - ChatGPTへ貼り付けやすい通知文をコピー
 - 候補を`trades.csv`へ記録
+
+## 場中エントリー監視
+
+`場中エントリー監視`タブでは、日足ベースのスイング候補とは別に、5分足を使って「今買える形になったか」を判定します。自動売買は行わず、画面上の通知と通知文生成だけを行います。
+
+使い方:
+
+1. `場中エントリー監視`タブを開きます。
+2. 対象を選びます。
+   - `watchlist.csv全銘柄を対象`
+   - `買い候補・監視銘柄を対象に含める`
+   - 手動入力コード
+3. `場中データを更新`を押します。
+4. `買い検討OK`、`監視強化`、`見送り`の折りたたみを開いて詳細を確認します。
+
+取得テスト:
+
+- `場中エントリー監視`タブの`取得テスト`から、任意の銘柄コードでyfinance取得状況を確認できます。
+- 初期値は`5803`です。
+- 入力コード、yfinance用シンボル、日足取得行数、5分足取得行数、最新Close、エラー内容を表示します。
+- `5803`、`5803.T`、`5803.0`、`5803.T.T`のような入力は共通の正規化処理で`5803.T`に変換します。
+
+判定に使う主な要素:
+
+- 現在値が短期線・中期線・長期線の上にあるか
+- 当日安値から反発しているか
+- 直近安値を切り上げているか
+- 50円刻み、100円刻みなどの節目を突破・維持しているか
+- 出来高が直近平均より増えているか
+- 損切りを近く置けるか
+- 第1利確までの値幅が損切り幅以上あるか
+
+通知条件:
+
+- `intraday_score >= 75` かつハードな見送り条件がない場合: `買い検討OK`
+- `65 <= intraday_score < 75` かつハードな見送り条件がない場合: `監視強化`
+- それ以外: `見送り`
+
+以下の場合はスコアに関係なく`買い検討OK`にしません。
+
+- 前日安値割れ
+- 当日安値更新中
+- 出来高が極端に少ない
+- 損切り幅が利確幅より大きすぎる
+- 第1利確までの距離が近すぎる
+- 移動平均線の下で推移
+
+画面通知:
+
+- `買い検討OK`または`監視強化`の銘柄は、Streamlit画面上に通知されます。
+- 同じ銘柄で同じ条件の通知が連続しないように、セッション内で通知済みキーを管理します。
+- 通知履歴はローカルでは`alerts_log.csv`に保存されます。
+
+Discord通知:
+
+- ローカルでは`.env`、Streamlit CloudではSecretsに`DISCORD_WEBHOOK_URL`を設定します。
+- 任意で`DISCORD_MENTION_ID`を設定すると、通知本文の先頭にDiscordメンションを付けます。
+- `場中エントリー監視`タブで`Discord通知ON/OFF`をONにすると、条件を満たした`買い検討OK`だけをDiscordへ送信します。
+- `見送り`はDiscord通知しません。
+- `テスト通知`ボタンでWebhook設定を確認できます。
+- 同じ銘柄・同じ判定はセッション内で重複通知しないようにしています。
+- 通知の成功/失敗は画面に表示され、`alerts_log.csv`にも`discord_sent`、`discord_error`として保存されます。
+
+本番通知ルール:
+
+- `Discord通知ON/OFF`がONのときだけ送信します。
+- 自動通知は市場時間内のみです。テスト通知は市場時間外でも送れます。
+- `自動監視ON/OFF`がONの間、ブラウザでStreamlit画面を開いているセッションだけが60秒、120秒、300秒の選択間隔で場中スキャンを再実行します。
+- 通知対象は場中エントリー監視で`買い検討OK`、かつ`intraday_score >= 70`の銘柄だけです。
+- `監視強化`や60点台の監視候補はDiscord通知しません。
+- 初回スキャン時の既存候補は一括通知しません。
+- 同じ銘柄は最低30分あけてから再通知します。
+- Webhook URLとDiscordユーザーIDは画面やログに表示しません。
+- PCスリープ中、Streamlit停止中、ブラウザを閉じている間は自動監視できません。
+
+注意:
+
+- yfinanceの5分足が取得できない時間帯や銘柄では、該当銘柄だけ`取得失敗`として表示します。
+- 全銘柄が取得失敗になった場合は、銘柄コード形式、yfinance接続、watchlist.csv形式を確認するためのデバッグ表を表示します。
+- Streamlit Cloud上の`alerts_log.csv`は永続保存ではありません。
+- 場中エントリー監視は、既存の日足スイング候補抽出とは別判定です。
+- 最終判断は必ず人間が行ってください。
 
 ## バックテスト
 
@@ -270,7 +363,7 @@ python backtest.py
 - J-Quants APIへのデータ取得差し替え
 - Google Sheetsや外部DBへの検証履歴保存
 - 日経平均、TOPIX、米国指数、先物を使った地合いフィルター
-- Discord、Gmail、LINE系通知
+- Gmail、LINE系通知
 - 売買履歴の自動評価とチャート上の売買ポイント表示
 - スコア条件の画面編集
 
@@ -280,5 +373,5 @@ python backtest.py
 - バックテストは簡易実装です。
 - J-Quants API接続は未実装です。
 - 地合いフィルターは個別銘柄トレンドによる仮スコアです。
-- Cloud上の`trades.csv`は永続保存ではありません。
+- Cloud上の`trades.csv`と`alerts_log.csv`は永続保存ではありません。
 - OpenAI APIが使えない場合はルールベースコメントに自動フォールバックします。
