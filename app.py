@@ -26,7 +26,12 @@ from scanner import (
 )
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD
 from stock_personality import generate_stock_personalities
-from virtual_trade_store import insert_virtual_trade, load_virtual_trades, rows_to_display
+from virtual_trade_store import (
+    get_virtual_database_list,
+    insert_virtual_trade,
+    load_virtual_trades,
+    rows_to_display,
+)
 
 st.set_page_config(
     page_title="日本株 1〜5日スイング候補ツール",
@@ -1074,6 +1079,38 @@ def _ai_candidate_table(signals: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _ai_virtual_json_safe_value(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame) or isinstance(value, pd.Series):
+        return None
+    if isinstance(value, dict):
+        return {
+            str(key): _ai_virtual_json_safe_value(item)
+            for key, item in value.items()
+            if not isinstance(item, (pd.DataFrame, pd.Series))
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _ai_virtual_json_safe_value(item)
+            for item in value
+            if not isinstance(item, (pd.DataFrame, pd.Series))
+        ]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _snapshot_ai_virtual_candidates(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    snapshots = []
+    for signal in signals:
+        compact = {
+            str(key): _ai_virtual_json_safe_value(value)
+            for key, value in signal.items()
+            if not isinstance(value, (pd.DataFrame, pd.Series))
+        }
+        snapshots.append(compact)
+    return snapshots
+
+
 def _render_virtual_trade_result(result: Dict[str, Any], idx: int) -> None:
     record = result.get("record", {})
     decision = result.get("decision", {})
@@ -1189,6 +1226,84 @@ def _insert_ai_virtual_db_test_record() -> int:
     )
 
 
+def _ai_virtual_now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _refresh_ai_virtual_db_debug_state() -> None:
+    st.session_state["last_ai_virtual_recent"] = rows_to_display(load_virtual_trades(limit=10)).to_dict("records")
+    st.session_state["ai_virtual_database_list"] = get_virtual_database_list()
+
+
+def _mark_ai_virtual_callback_click(source: str) -> str:
+    clicked_at = _ai_virtual_now_text()
+    st.session_state["ai_virtual_click_count"] = int(st.session_state.get("ai_virtual_click_count", 0)) + 1
+    st.session_state["ai_virtual_last_click_at"] = clicked_at
+    st.session_state["ai_virtual_last_click_source"] = source
+    return clicked_at
+
+
+def _on_ai_virtual_db_test_click() -> None:
+    clicked_at = _mark_ai_virtual_callback_click("db_test")
+    try:
+        trade_id = _insert_ai_virtual_db_test_record()
+        _refresh_ai_virtual_db_debug_state()
+        st.session_state["last_ai_virtual_db_test"] = {
+            "ok": True,
+            "trade_id": trade_id,
+            "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "timestamp": clicked_at,
+        }
+        st.session_state["ai_virtual_last_error"] = ""
+    except Exception as exc:
+        st.session_state["last_ai_virtual_db_test"] = {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "timestamp": clicked_at,
+        }
+        st.session_state["ai_virtual_last_error"] = f"{exc.__class__.__name__}: {exc}"
+
+
+def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = None) -> None:
+    clicked_at = _mark_ai_virtual_callback_click("ai_virtual_run")
+    candidates = list(candidates_snapshot or st.session_state.get("ai_virtual_candidates_snapshot", []))
+    try:
+        results = process_virtual_trade_signals(candidates)
+        saved_count = sum(1 for result in results if result.get("saved"))
+        failed_count = len(results) - saved_count
+        _refresh_ai_virtual_db_debug_state()
+        st.session_state["last_ai_virtual_results"] = results
+        st.session_state["last_ai_virtual_run"] = {
+            "timestamp": clicked_at,
+            "candidate_count": len(candidates),
+            "saved_count": saved_count,
+            "failed_count": failed_count,
+            "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "event_label": "AI仮想判断コールバックを検知しました",
+            "reason_summary": [result.get("reason", "") for result in results],
+            "error": "",
+        }
+        st.session_state["ai_virtual_last_error"] = ""
+    except Exception as exc:
+        try:
+            _refresh_ai_virtual_db_debug_state()
+        except Exception:
+            pass
+        st.session_state["last_ai_virtual_results"] = []
+        st.session_state["last_ai_virtual_run"] = {
+            "timestamp": clicked_at,
+            "candidate_count": len(candidates),
+            "saved_count": 0,
+            "failed_count": len(candidates),
+            "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "event_label": "AI仮想判断コールバックを検知しました",
+            "reason_summary": [],
+            "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}: {exc}",
+        }
+        st.session_state["ai_virtual_last_error"] = f"{exc.__class__.__name__}: {exc}"
+
+
 def _render_ai_virtual_db_test_result() -> None:
     result = st.session_state.get("last_ai_virtual_db_test")
     if not result:
@@ -1197,6 +1312,51 @@ def _render_ai_virtual_db_test_result() -> None:
         st.success(f"DB疎通テスト成功: trade_id={result.get('trade_id')} / db_path={result.get('db_path')}")
     else:
         st.error(f"DB疎通テスト失敗: {result.get('error', '-')}")
+
+
+def _render_ai_virtual_callback_debug_state() -> None:
+    st.markdown("**callback方式テスト中**")
+    cols = st.columns(3)
+    cols[0].metric("click_count", int(st.session_state.get("ai_virtual_click_count", 0)))
+    cols[1].metric("last_click_at", st.session_state.get("ai_virtual_last_click_at", "-"))
+    cols[2].metric("last_source", st.session_state.get("ai_virtual_last_click_source", "-"))
+
+    if st.session_state.get("ai_virtual_last_error"):
+        st.error(st.session_state["ai_virtual_last_error"])
+
+    db_state = st.session_state.get("last_ai_virtual_db_test", {})
+    run_state = st.session_state.get("last_ai_virtual_run", {})
+    results = st.session_state.get("last_ai_virtual_results", [])
+
+    st.markdown("**last_ai_virtual_db_test**")
+    st.json(db_state)
+    st.markdown("**last_ai_virtual_run**")
+    st.json(run_state)
+    st.markdown("**last_ai_virtual_results**")
+    if results:
+        st.dataframe(_safe_dataframe(_virtual_result_table(results)), width="stretch", hide_index=True)
+    else:
+        st.info("last_ai_virtual_results はまだ空です。")
+
+    database_list = st.session_state.get("ai_virtual_database_list")
+    if database_list is None:
+        try:
+            database_list = get_virtual_database_list()
+            st.session_state["ai_virtual_database_list"] = database_list
+        except Exception as exc:
+            database_list = [{"error": f"{exc.__class__.__name__}: {exc}"}]
+    st.markdown("**SQLite PRAGMA database_list**")
+    st.dataframe(_safe_dataframe(pd.DataFrame(database_list)), width="stretch", hide_index=True)
+
+    st.markdown("**load_virtual_trades(limit=10) の直近ログ**")
+    try:
+        recent = rows_to_display(load_virtual_trades(limit=10))
+        if recent.empty:
+            st.info("直近ログはまだありません。")
+        else:
+            st.dataframe(_safe_dataframe(recent), width="stretch", hide_index=True)
+    except Exception as exc:
+        st.error(f"直近ログ取得失敗: {exc.__class__.__name__}: {exc}")
 
 
 def _render_ai_virtual_trade_tab(
@@ -1221,6 +1381,8 @@ def _render_ai_virtual_trade_tab(
     max_candidates = st.selectbox("AI仮想判断する件数", [1, 3, 5, 10], index=1)
     candidates = list(buy) + (list(watch) if include_watch else [])
     candidates = sorted(candidates, key=lambda item: _score(item), reverse=True)[: int(max_candidates)]
+    candidates_snapshot = _snapshot_ai_virtual_candidates(candidates)
+    st.session_state["ai_virtual_candidates_snapshot"] = candidates_snapshot
 
     st.markdown("**今回のAI仮想判断候補**")
     if candidates:
@@ -1229,74 +1391,23 @@ def _render_ai_virtual_trade_tab(
         st.info("AI仮想判断できる候補がありません。")
     st.caption(f"候補数: {len(candidates)} / 仮想取引DB: {VIRTUAL_TRADES_DB_PATH}")
 
-    if st.button("DB疎通テスト", key="ai_virtual_db_test_button"):
-        try:
-            trade_id = _insert_ai_virtual_db_test_record()
-            recent_after = rows_to_display(load_virtual_trades(limit=10))
-            st.session_state["last_ai_virtual_recent"] = recent_after.to_dict("records")
-            st.session_state["last_ai_virtual_db_test"] = {
-                "ok": True,
-                "trade_id": trade_id,
-                "db_path": str(VIRTUAL_TRADES_DB_PATH),
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        except Exception as exc:
-            st.session_state["last_ai_virtual_db_test"] = {
-                "ok": False,
-                "error": f"{exc.__class__.__name__}: {exc}",
-                "db_path": str(VIRTUAL_TRADES_DB_PATH),
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            st.error("DB疎通テスト中に例外が発生しました。")
-            st.exception(exc)
-
+    st.button(
+        "DB疎通テスト",
+        key="ai_virtual_db_test_button",
+        on_click=_on_ai_virtual_db_test_click,
+    )
     _render_ai_virtual_db_test_result()
 
-    with st.form(key="ai_virtual_trade_form"):
-        st.caption("フォーム送信でAI仮想判断を実行します。")
-        submitted = st.form_submit_button(
-            "AI仮想判断を実行",
-            type="primary",
-            disabled=not candidates,
-        )
+    st.button(
+        "AI仮想判断を実行",
+        key="run_ai_virtual_trade_callback_button",
+        type="primary",
+        disabled=not candidates_snapshot,
+        on_click=_on_ai_virtual_run_click,
+        args=(candidates_snapshot,),
+    )
 
-    if submitted:
-        run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.info("フォーム送信を検知しました")
-        st.write(f"候補数: {len(candidates)}")
-        st.write(f"DBパス: {VIRTUAL_TRADES_DB_PATH}")
-        try:
-            with st.spinner("AI仮想取引判断を作成して保存中です..."):
-                results = process_virtual_trade_signals(candidates)
-            saved_count = sum(1 for result in results if result.get("saved"))
-            failed_count = len(results) - saved_count
-            recent_after = rows_to_display(load_virtual_trades(limit=10))
-            st.session_state["last_ai_virtual_results"] = results
-            st.session_state["last_ai_virtual_recent"] = recent_after.to_dict("records")
-            st.session_state["last_ai_virtual_run"] = {
-                "timestamp": run_timestamp,
-                "candidate_count": len(candidates),
-                "saved_count": saved_count,
-                "failed_count": failed_count,
-                "db_path": str(VIRTUAL_TRADES_DB_PATH),
-                "event_label": "フォーム送信を検知しました",
-                "error": "",
-            }
-        except Exception as exc:
-            st.session_state["last_ai_virtual_results"] = []
-            st.session_state["last_ai_virtual_recent"] = rows_to_display(load_virtual_trades(limit=10)).to_dict("records")
-            st.session_state["last_ai_virtual_run"] = {
-                "timestamp": run_timestamp,
-                "candidate_count": len(candidates),
-                "saved_count": 0,
-                "failed_count": len(candidates),
-                "db_path": str(VIRTUAL_TRADES_DB_PATH),
-                "event_label": "フォーム送信を検知しました",
-                "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}",
-            }
-            st.error("AI仮想判断中に例外が発生しました。")
-            st.exception(exc)
-
+    _render_ai_virtual_callback_debug_state()
     _render_last_ai_virtual_run()
 
     if st.button("open仮想取引の結果を更新", key="update_virtual_outcomes_button"):
@@ -1435,6 +1546,18 @@ def main() -> None:
         if st.button("株価を再取得"):
             st.session_state.refresh_token += 1
             st.cache_data.clear()
+        st.divider()
+        st.button(
+            "AI DB疎通テスト",
+            key="sidebar_ai_virtual_db_test_button",
+            on_click=_on_ai_virtual_db_test_click,
+        )
+        if st.session_state.get("last_ai_virtual_db_test", {}).get("ok"):
+            st.caption(
+                f"AI DB OK: trade_id={st.session_state['last_ai_virtual_db_test'].get('trade_id')}"
+            )
+        elif st.session_state.get("last_ai_virtual_db_test"):
+            st.caption("AI DBテスト失敗")
 
     try:
         watchlist = load_watchlist()

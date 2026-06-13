@@ -41,6 +41,7 @@ VIRTUAL_TRADE_COLUMNS = [
 
 
 def _connect(path: Path = VIRTUAL_TRADES_DB_PATH) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(path)
 
 
@@ -95,6 +96,13 @@ def ensure_virtual_trade_store(path: Path = VIRTUAL_TRADES_DB_PATH) -> None:
 
 def _json_text(value: Any) -> str:
     return json.dumps(value if value is not None else [], ensure_ascii=False, default=str)
+
+
+def get_virtual_database_list(path: Path = VIRTUAL_TRADES_DB_PATH) -> List[Dict[str, Any]]:
+    """Return SQLite PRAGMA database_list for debugging the actual DB file path."""
+    with closing(_connect(path)) as conn:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    return [{"seq": row[0], "name": row[1], "file": row[2]} for row in rows]
 
 
 def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_PATH) -> int:
