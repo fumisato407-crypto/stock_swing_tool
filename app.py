@@ -26,7 +26,7 @@ from scanner import (
 )
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD
 from stock_personality import generate_stock_personalities
-from virtual_trade_store import load_virtual_trades, rows_to_display
+from virtual_trade_store import insert_virtual_trade, load_virtual_trades, rows_to_display
 
 st.set_page_config(
     page_title="日本株 1〜5日スイング候補ツール",
@@ -1126,8 +1126,10 @@ def _render_last_ai_virtual_run() -> None:
         return
 
     st.markdown("**直近のAI仮想判断実行結果**")
-    st.info(f"ボタン押下を検知しました（{run_state.get('timestamp', '-')}）")
+    event_label = run_state.get("event_label", "フォーム送信を検知しました")
+    st.info(f"{event_label}（{run_state.get('timestamp', '-')}）")
     st.write(f"候補数: {run_state.get('candidate_count', 0)}")
+    st.write(f"DBパス: {run_state.get('db_path', VIRTUAL_TRADES_DB_PATH)}")
 
     if run_state.get("error"):
         st.error(run_state.get("error"))
@@ -1160,6 +1162,43 @@ def _render_last_ai_virtual_run() -> None:
         st.info("保存後に再取得した最近ログは空です。")
 
 
+def _insert_ai_virtual_db_test_record() -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    return insert_virtual_trade(
+        {
+            "timestamp": now,
+            "symbol": "DB_TEST",
+            "name": "DB疎通テスト",
+            "decision": "virtual_watch",
+            "entry_type": "db_connection_test",
+            "confidence": "テスト",
+            "entry_price": 0,
+            "stop_loss": 0,
+            "take_profit": 0,
+            "max_hold_days": 0,
+            "reasons": ["DB疎通テスト用のdummyレコード"],
+            "risk_factors": ["実売買・AI判断ではありません"],
+            "source_score": 0,
+            "market_snapshot_json": {
+                "test": True,
+                "created_at": now,
+                "source": "ai_virtual_trade_db_test",
+            },
+            "status": "logged",
+        }
+    )
+
+
+def _render_ai_virtual_db_test_result() -> None:
+    result = st.session_state.get("last_ai_virtual_db_test")
+    if not result:
+        return
+    if result.get("ok"):
+        st.success(f"DB疎通テスト成功: trade_id={result.get('trade_id')} / db_path={result.get('db_path')}")
+    else:
+        st.error(f"DB疎通テスト失敗: {result.get('error', '-')}")
+
+
 def _render_ai_virtual_trade_tab(
     buy: List[Dict[str, Any]],
     watch: List[Dict[str, Any]],
@@ -1190,16 +1229,42 @@ def _render_ai_virtual_trade_tab(
         st.info("AI仮想判断できる候補がありません。")
     st.caption(f"候補数: {len(candidates)} / 仮想取引DB: {VIRTUAL_TRADES_DB_PATH}")
 
-    run_clicked = st.button(
-        "AI仮想判断を実行",
-        key="run_ai_virtual_trade_button",
-        type="primary",
-        disabled=not candidates,
-    )
-    if run_clicked:
+    if st.button("DB疎通テスト", key="ai_virtual_db_test_button"):
+        try:
+            trade_id = _insert_ai_virtual_db_test_record()
+            recent_after = rows_to_display(load_virtual_trades(limit=10))
+            st.session_state["last_ai_virtual_recent"] = recent_after.to_dict("records")
+            st.session_state["last_ai_virtual_db_test"] = {
+                "ok": True,
+                "trade_id": trade_id,
+                "db_path": str(VIRTUAL_TRADES_DB_PATH),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        except Exception as exc:
+            st.session_state["last_ai_virtual_db_test"] = {
+                "ok": False,
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "db_path": str(VIRTUAL_TRADES_DB_PATH),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            st.error("DB疎通テスト中に例外が発生しました。")
+            st.exception(exc)
+
+    _render_ai_virtual_db_test_result()
+
+    with st.form(key="ai_virtual_trade_form"):
+        st.caption("フォーム送信でAI仮想判断を実行します。")
+        submitted = st.form_submit_button(
+            "AI仮想判断を実行",
+            type="primary",
+            disabled=not candidates,
+        )
+
+    if submitted:
         run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.info("ボタン押下を検知しました")
+        st.info("フォーム送信を検知しました")
         st.write(f"候補数: {len(candidates)}")
+        st.write(f"DBパス: {VIRTUAL_TRADES_DB_PATH}")
         try:
             with st.spinner("AI仮想取引判断を作成して保存中です..."):
                 results = process_virtual_trade_signals(candidates)
@@ -1213,6 +1278,8 @@ def _render_ai_virtual_trade_tab(
                 "candidate_count": len(candidates),
                 "saved_count": saved_count,
                 "failed_count": failed_count,
+                "db_path": str(VIRTUAL_TRADES_DB_PATH),
+                "event_label": "フォーム送信を検知しました",
                 "error": "",
             }
         except Exception as exc:
@@ -1223,6 +1290,8 @@ def _render_ai_virtual_trade_tab(
                 "candidate_count": len(candidates),
                 "saved_count": 0,
                 "failed_count": len(candidates),
+                "db_path": str(VIRTUAL_TRADES_DB_PATH),
+                "event_label": "フォーム送信を検知しました",
                 "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}",
             }
             st.error("AI仮想判断中に例外が発生しました。")
