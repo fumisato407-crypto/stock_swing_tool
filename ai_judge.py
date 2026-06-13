@@ -223,6 +223,10 @@ def _validate_virtual_decision(raw: Dict[str, Any], fallback: Dict[str, Any]) ->
     decision = str(raw.get("decision", fallback["decision"]))
     if decision not in VIRTUAL_DECISIONS:
         decision = fallback["decision"]
+    model_used = str(raw.get("model_used") or get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL))
+    is_ai_generated = bool(raw.get("is_ai_generated", True))
+    if model_used == "rule_based_fallback":
+        is_ai_generated = False
 
     return {
         "decision": decision,
@@ -234,8 +238,8 @@ def _validate_virtual_decision(raw: Dict[str, Any], fallback: Dict[str, Any]) ->
         "max_hold_days": int(_num(raw.get("max_hold_days"), fallback["max_hold_days"])),
         "reasons": _safe_list(raw.get("reasons")) or fallback["reasons"],
         "risk_factors": _safe_list(raw.get("risk_factors")) or fallback["risk_factors"],
-        "model_used": str(raw.get("model_used") or get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)),
-        "is_ai_generated": bool(raw.get("is_ai_generated", True)),
+        "model_used": model_used,
+        "is_ai_generated": is_ai_generated,
     }
 
 

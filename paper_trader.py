@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List
 
 from ai_judge import build_market_snapshot, judge_virtual_trade
 from config import VIRTUAL_TRADES_DB_PATH
 from data_fetcher import normalize_jp_symbol
+from time_utils import now_jst_iso
 from virtual_trade_store import find_recent_virtual_trade, insert_virtual_trade
 
 
@@ -23,13 +23,44 @@ def _symbol(signal: Dict[str, Any]) -> str:
     return normalize_jp_symbol(signal.get("normalized_symbol") or signal.get("code"))
 
 
+def _is_ai_generated(decision: Dict[str, Any]) -> bool:
+    value = decision.get("is_ai_generated", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "gpt"}
+    return bool(value)
+
+
+def _judge_source(decision: Dict[str, Any]) -> str:
+    model_used = str(decision.get("model_used", "") or "")
+    if _is_ai_generated(decision):
+        return "gpt"
+    if model_used == "rule_based_fallback":
+        return "fallback"
+    if model_used:
+        return "fallback" if "fallback" in model_used.lower() else "unknown"
+    return "unknown"
+
+
+def _model_used(decision: Dict[str, Any]) -> str:
+    source = _judge_source(decision)
+    if source == "fallback":
+        return "rule_based_fallback"
+    return str(decision.get("model_used", "") or "unknown")
+
+
 def build_virtual_trade_record(
     signal: Dict[str, Any],
     decision: Dict[str, Any],
     market_snapshot: Dict[str, Any],
 ) -> Dict[str, Any]:
+    timestamp_jst = now_jst_iso()
+    is_ai_generated = _is_ai_generated(decision)
+    judge_source = _judge_source(decision)
+    model_used = _model_used(decision)
     return {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": timestamp_jst,
+        "timestamp_jst": timestamp_jst,
+        "created_at_jst": timestamp_jst,
         "symbol": _symbol(signal),
         "name": str(signal.get("name", "")),
         "decision": decision.get("decision", "virtual_watch"),
@@ -44,6 +75,9 @@ def build_virtual_trade_record(
         "source_score": _source_score(signal),
         "market_snapshot_json": market_snapshot,
         "status": "open" if decision.get("decision") == "virtual_buy" else "logged",
+        "model_used": model_used,
+        "is_ai_generated": 1 if is_ai_generated else 0,
+        "judge_source": judge_source,
     }
 
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from data_fetcher import clean_ohlcv_data, fetch_price_data
+from time_utils import now_jst_iso, parse_trade_datetime_to_jst_naive
 from virtual_trade_store import load_open_virtual_trades, update_virtual_trade_outcome
 
 
@@ -28,10 +28,23 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 
 def _entry_datetime(value: Any) -> Optional[datetime]:
+    return parse_trade_datetime_to_jst_naive(value)
+
+
+def _normalize_ohlcv_index_to_jst_naive(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        return data
+    normalized = data.copy()
+    index = pd.to_datetime(normalized.index)
     try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
+        if index.tz is not None:
+            index = index.tz_convert("Asia/Tokyo").tz_localize(None)
+        else:
+            index = index.tz_localize(None)
+    except Exception:
+        index = pd.to_datetime(normalized.index).tz_localize(None)
+    normalized.index = index
+    return normalized.sort_index()
 
 
 def _fetch_intraday_for_1h(symbol: str) -> pd.DataFrame:
@@ -169,11 +182,12 @@ def update_open_virtual_trade_outcomes() -> Dict[str, Any]:
             skipped += 1
             errors.append(f"{symbol}: daily data unavailable")
             continue
+        daily = _normalize_ohlcv_index_to_jst_naive(fetched.data)
 
-        checkpoints = _checkpoint_returns(fetched.data, entry_dt, entry_price)
+        checkpoints = _checkpoint_returns(daily, entry_dt, entry_price)
         checkpoints["1h"] = _one_hour_return(symbol, entry_dt, entry_price)
         path_result = _evaluate_path(
-            daily=fetched.data,
+            daily=daily,
             entry_dt=entry_dt,
             entry_price=entry_price,
             stop_loss=_num(trade.get("stop_loss")),
@@ -195,7 +209,8 @@ def update_open_virtual_trade_outcomes() -> Dict[str, Any]:
                 "hit_take_profit": 1 if path_result["hit_take_profit"] else 0,
                 "outcome": path_result["outcome"],
                 "outcome_json": json.dumps(outcome_json, ensure_ascii=False, default=str),
-                "outcome_updated_at": datetime.now().isoformat(timespec="seconds"),
+                "outcome_updated_at": now_jst_iso(),
+                "outcome_updated_at_jst": now_jst_iso(),
             },
         )
         updated += 1

@@ -26,6 +26,7 @@ from scanner import (
 )
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD
 from stock_personality import generate_stock_personalities
+from time_utils import now_jst_display, now_jst_iso
 from virtual_trade_store import (
     get_virtual_database_list,
     insert_virtual_trade,
@@ -1126,6 +1127,12 @@ def _render_virtual_trade_result(result: Dict[str, Any], idx: int) -> None:
         cols[1].metric("確度", decision.get("confidence", "-"))
         cols[2].metric("仮想買値", format_yen(decision.get("entry_price")))
         cols[3].metric("最大保有", f"{decision.get('max_hold_days', '-')}日")
+        st.markdown(
+            f"**判断ソース**：{record.get('judge_source', '-')} / "
+            f"**model**：{record.get('model_used', '-')} / "
+            f"**AI生成**：{record.get('is_ai_generated', '-')}"
+        )
+        st.markdown(f"**JST時刻**：{record.get('timestamp_jst', record.get('timestamp', '-'))}")
         st.markdown(f"**損切り**：{format_yen(decision.get('stop_loss'))}")
         st.markdown(f"**利確**：{format_yen(decision.get('take_profit'))}")
         _render_reason_list("理由", decision.get("reasons"))
@@ -1146,10 +1153,14 @@ def _virtual_result_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
                 "trade_id": result.get("trade_id", ""),
                 "duplicate_id": result.get("duplicate_id", ""),
                 "db_path": result.get("db_path", str(VIRTUAL_TRADES_DB_PATH)),
+                "timestamp_jst": record.get("timestamp_jst", ""),
                 "symbol": record.get("symbol") or record.get("code") or "",
                 "name": record.get("name", ""),
                 "decision": decision.get("decision", record.get("decision", "")),
                 "entry_type": decision.get("entry_type", record.get("entry_type", "")),
+                "judge_source": record.get("judge_source", decision.get("judge_source", "")),
+                "model_used": record.get("model_used", decision.get("model_used", "")),
+                "is_ai_generated": record.get("is_ai_generated", decision.get("is_ai_generated", "")),
                 "source_score": record.get("source_score", ""),
             }
         )
@@ -1200,10 +1211,12 @@ def _render_last_ai_virtual_run() -> None:
 
 
 def _insert_ai_virtual_db_test_record() -> int:
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_jst_iso()
     return insert_virtual_trade(
         {
             "timestamp": now,
+            "timestamp_jst": now,
+            "created_at_jst": now,
             "symbol": "DB_TEST",
             "name": "DB疎通テスト",
             "decision": "virtual_watch",
@@ -1216,6 +1229,9 @@ def _insert_ai_virtual_db_test_record() -> int:
             "reasons": ["DB疎通テスト用のdummyレコード"],
             "risk_factors": ["実売買・AI判断ではありません"],
             "source_score": 0,
+            "model_used": "db_test",
+            "is_ai_generated": 0,
+            "judge_source": "test",
             "market_snapshot_json": {
                 "test": True,
                 "created_at": now,
@@ -1227,7 +1243,7 @@ def _insert_ai_virtual_db_test_record() -> int:
 
 
 def _ai_virtual_now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return now_jst_display()
 
 
 def _refresh_ai_virtual_db_debug_state() -> None:
@@ -1423,11 +1439,15 @@ def _render_ai_virtual_trade_tab(
             st.info("まだAI仮想取引ログはありません。")
         else:
             columns = [
+                "timestamp_jst",
                 "timestamp",
                 "symbol",
                 "name",
                 "decision",
                 "entry_type",
+                "judge_source",
+                "model_used",
+                "is_ai_generated",
                 "confidence",
                 "entry_price",
                 "stop_loss",
@@ -1459,16 +1479,21 @@ def _render_virtual_performance_tab() -> None:
 
     with st.expander("仮想取引一覧", expanded=False):
         show_cols = [
+            "timestamp_jst",
             "timestamp",
             "symbol",
             "name",
             "decision",
             "entry_type",
+            "judge_source",
+            "model_used",
+            "is_ai_generated",
             "entry_price",
             "return_pct",
             "max_profit_pct",
             "max_drawdown_pct",
             "outcome",
+            "outcome_updated_at_jst",
             "status",
         ]
         st.dataframe(_safe_dataframe(rows_to_display(trades)[[col for col in show_cols if col in trades.columns]]), width="stretch", hide_index=True)

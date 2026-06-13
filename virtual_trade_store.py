@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from config import VIRTUAL_TRADES_DB_PATH
+from time_utils import now_jst_iso, parse_trade_datetime_to_jst_naive
 
 
 VIRTUAL_TRADE_COLUMNS = [
@@ -37,6 +38,12 @@ VIRTUAL_TRADE_COLUMNS = [
     "outcome",
     "outcome_json",
     "outcome_updated_at",
+    "model_used",
+    "is_ai_generated",
+    "judge_source",
+    "timestamp_jst",
+    "created_at_jst",
+    "outcome_updated_at_jst",
 ]
 
 
@@ -73,7 +80,13 @@ def ensure_virtual_trade_store(path: Path = VIRTUAL_TRADES_DB_PATH) -> None:
                 hit_take_profit INTEGER DEFAULT 0,
                 outcome TEXT,
                 outcome_json TEXT,
-                outcome_updated_at TEXT
+                outcome_updated_at TEXT,
+                model_used TEXT,
+                is_ai_generated INTEGER DEFAULT 0,
+                judge_source TEXT,
+                timestamp_jst TEXT,
+                created_at_jst TEXT,
+                outcome_updated_at_jst TEXT
             )
             """
         )
@@ -87,6 +100,12 @@ def ensure_virtual_trade_store(path: Path = VIRTUAL_TRADES_DB_PATH) -> None:
             "outcome": "TEXT",
             "outcome_json": "TEXT",
             "outcome_updated_at": "TEXT",
+            "model_used": "TEXT",
+            "is_ai_generated": "INTEGER DEFAULT 0",
+            "judge_source": "TEXT",
+            "timestamp_jst": "TEXT",
+            "created_at_jst": "TEXT",
+            "outcome_updated_at_jst": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing:
@@ -107,8 +126,11 @@ def get_virtual_database_list(path: Path = VIRTUAL_TRADES_DB_PATH) -> List[Dict[
 
 def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_PATH) -> int:
     ensure_virtual_trade_store(path)
+    timestamp = record.get("timestamp") or now_jst_iso()
+    timestamp_jst = record.get("timestamp_jst") or timestamp
+    created_at_jst = record.get("created_at_jst") or timestamp_jst
     payload = {
-        "timestamp": record.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+        "timestamp": timestamp,
         "symbol": str(record.get("symbol", "")),
         "name": str(record.get("name", "")),
         "decision": str(record.get("decision", "")),
@@ -123,6 +145,11 @@ def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_
         "source_score": record.get("source_score"),
         "market_snapshot_json": _json_text(record.get("market_snapshot_json")),
         "status": str(record.get("status", "logged")),
+        "model_used": str(record.get("model_used", "")),
+        "is_ai_generated": 1 if record.get("is_ai_generated") else 0,
+        "judge_source": str(record.get("judge_source", "unknown")),
+        "timestamp_jst": timestamp_jst,
+        "created_at_jst": created_at_jst,
     }
     with closing(_connect(path)) as conn:
         cur = conn.execute(
@@ -130,11 +157,13 @@ def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_
             INSERT INTO virtual_trades (
                 timestamp, symbol, name, decision, entry_type, confidence,
                 entry_price, stop_loss, take_profit, max_hold_days,
-                reasons, risk_factors, source_score, market_snapshot_json, status
+                reasons, risk_factors, source_score, market_snapshot_json, status,
+                model_used, is_ai_generated, judge_source, timestamp_jst, created_at_jst
             ) VALUES (
                 :timestamp, :symbol, :name, :decision, :entry_type, :confidence,
                 :entry_price, :stop_loss, :take_profit, :max_hold_days,
-                :reasons, :risk_factors, :source_score, :market_snapshot_json, :status
+                :reasons, :risk_factors, :source_score, :market_snapshot_json, :status,
+                :model_used, :is_ai_generated, :judge_source, :timestamp_jst, :created_at_jst
             )
             """,
             payload,
@@ -167,7 +196,8 @@ def find_recent_virtual_trade(
     path: Path = VIRTUAL_TRADES_DB_PATH,
 ) -> Optional[Dict[str, Any]]:
     ensure_virtual_trade_store(path)
-    cutoff = datetime.now().timestamp() - minutes * 60
+    cutoff = parse_trade_datetime_to_jst_naive(now_jst_iso())
+    cutoff_ts = cutoff.timestamp() - minutes * 60 if cutoff else datetime.now().timestamp() - minutes * 60
     with closing(_connect(path)) as conn:
         rows = conn.execute(
             """
@@ -182,11 +212,10 @@ def find_recent_virtual_trade(
 
     for row in rows:
         record = dict(zip(columns, row))
-        try:
-            ts = datetime.fromisoformat(str(record.get("timestamp"))).timestamp()
-        except ValueError:
+        parsed_ts = parse_trade_datetime_to_jst_naive(record.get("timestamp_jst") or record.get("timestamp"))
+        if parsed_ts is None:
             continue
-        if ts >= cutoff:
+        if parsed_ts.timestamp() >= cutoff_ts:
             return record
     return None
 
@@ -212,6 +241,7 @@ def update_virtual_trade_outcome(
         "outcome",
         "outcome_json",
         "outcome_updated_at",
+        "outcome_updated_at_jst",
     }
     payload = {key: value for key, value in updates.items() if key in allowed}
     if not payload:
@@ -230,6 +260,30 @@ def rows_to_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["reasons", "risk_factors"]:
         if col in display.columns:
             display[col] = display[col].map(_compact_json_list)
+    if "is_ai_generated" in display.columns:
+        display["is_ai_generated"] = display["is_ai_generated"].map(
+            lambda value: "1" if str(value).strip() in {"1", "True", "true"} else "0"
+        )
+    priority = [
+        "id",
+        "timestamp_jst",
+        "symbol",
+        "name",
+        "decision",
+        "entry_type",
+        "judge_source",
+        "model_used",
+        "is_ai_generated",
+        "confidence",
+        "entry_price",
+        "stop_loss",
+        "take_profit",
+        "source_score",
+        "status",
+    ]
+    ordered = [col for col in priority if col in display.columns]
+    ordered += [col for col in display.columns if col not in ordered]
+    display = display[ordered]
     return display.fillna("")
 
 

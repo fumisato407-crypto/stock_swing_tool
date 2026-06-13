@@ -260,6 +260,7 @@ Secretsに入れた値はGitHubには保存されません。GitHubのREADME、C
 - `watchlist.csv`はGitHubで管理します。
 - `trades.csv`はCloud上では一時保存扱いです。
 - `virtual_trades.db`はAI仮想取引専用の保存先です。Cloud上では一時保存扱いです。
+- Streamlit Cloud上のSQLiteは永続保存に向きません。本命の学習DBはローカルPCで運用してください。
 - `.env`はCloudでは使いません。Secretsを使います。
 - `runtime.txt`でPython 3.12を指定しています。
 - `requirements.txt`に必要な依存関係をまとめています。
@@ -375,6 +376,10 @@ Discord通知:
 - `trades.csv`や実トレード記録とは混ぜません。
 - `virtual_trades.db`は`.gitignore`で除外しています。
 - Streamlit Cloud上の`virtual_trades.db`は永続保存ではありません。
+- Streamlit Cloud上のSQLiteは再起動や再デプロイで消える可能性があります。検証を積み上げる本命DBはローカルPCで運用してください。
+- AI仮想取引ログには、判断元を示す`judge_source`、使用モデルを示す`model_used`、GPT生成かどうかを示す`is_ai_generated`を保存します。
+- `judge_source`は、GPT判断なら`gpt`、ルールベースfallbackなら`fallback`、DB疎通テストなら`test`になります。
+- AI仮想取引ログの時刻はJST基準で保存・表示します。互換性のため既存の`timestamp`も残し、新規保存では`timestamp_jst`と`created_at_jst`も保存します。
 
 使い方:
 
@@ -397,6 +402,7 @@ OpenAI API:
 - AI仮想取引のモデルは`AI_VIRTUAL_MODEL`で指定できます。初期値は`gpt-5.5`です。
 - APIキーがない、またはAPI呼び出しに失敗した場合は、アプリが落ちないようにルールベースの仮想判断へフォールバックします。
 - APIキーや秘密情報は画面、ログ、DBに表示しません。
+- OpenAI APIキーなしで保存した仮想判断は、`judge_source=fallback`、`model_used=rule_based_fallback`、`is_ai_generated=0`として記録されます。
 
 成績表示:
 
