@@ -23,6 +23,11 @@ stock_swing_tool/
 ├─ entry_rules.py
 ├─ alert_builder.py
 ├─ ai_judge.py
+├─ paper_trader.py
+├─ virtual_trade_store.py
+├─ outcome_tracker.py
+├─ pattern_stats.py
+├─ stock_personality.py
 ├─ notifier.py
 ├─ backtest.py
 ├─ config.py
@@ -144,6 +149,9 @@ secrets.toml
 .venv/
 __pycache__/
 streamlit*.log
+alerts_log.csv
+virtual_trades.db
+virtual_trades.db-*
 ```
 
 `.env.example`はサンプルなのでコミットして問題ありません。
@@ -230,6 +238,7 @@ App settings → Secrets
 ```toml
 OPENAI_API_KEY = ""
 OPENAI_MODEL = "gpt-4o-mini"
+AI_VIRTUAL_MODEL = "gpt-5.5"
 JQUANTS_EMAIL = ""
 JQUANTS_PASSWORD = ""
 NOTIFICATION_CHANNEL = "console"
@@ -250,6 +259,7 @@ Secretsに入れた値はGitHubには保存されません。GitHubのREADME、C
 
 - `watchlist.csv`はGitHubで管理します。
 - `trades.csv`はCloud上では一時保存扱いです。
+- `virtual_trades.db`はAI仮想取引専用の保存先です。Cloud上では一時保存扱いです。
 - `.env`はCloudでは使いません。Secretsを使います。
 - `runtime.txt`でPython 3.12を指定しています。
 - `requirements.txt`に必要な依存関係をまとめています。
@@ -262,6 +272,7 @@ Secretsに入れた値はGitHubには保存されません。GitHubのREADME、C
 - 銘柄ごとのスコア、買い条件、損切り、利確目安、期待値を確認
 - チャートとスコア内訳を確認
 - 場中の5分足から「買い検討OK」「監視強化」「見送り」を確認
+- GPTによるAI仮想取引の判断、仮想成績、銘柄別クセ、パターン別勝率を確認
 - 取得失敗時に正規化後シンボル、エラー種別、取得行数を確認
 - ChatGPTへ貼り付けやすい通知文をコピー
 - 候補を`trades.csv`へ記録
@@ -348,6 +359,52 @@ Discord通知:
 - 場中エントリー監視は、既存の日足スイング候補抽出とは別判定です。
 - 最終判断は必ず人間が行ってください。
 
+## AI仮想取引
+
+`AI仮想取引`タブでは、既存スコアで抽出した候補をGPTに渡し、paper trading / virtual trading専用の仮想判断を保存します。実売買、発注、自動売買、Discord本番通知への混在は行いません。
+
+判断結果:
+
+- `virtual_buy`: 仮想ポジションとしてopen保存します。
+- `virtual_watch`: 判断ログとして保存します。
+- `virtual_avoid`: 判断ログとして保存します。
+
+保存先:
+
+- AI仮想取引は`virtual_trades.db`に保存します。
+- `trades.csv`や実トレード記録とは混ぜません。
+- `virtual_trades.db`は`.gitignore`で除外しています。
+- Streamlit Cloud上の`virtual_trades.db`は永続保存ではありません。
+
+使い方:
+
+1. `AI仮想取引`タブを開きます。
+2. 買い候補だけ、または監視銘柄も含めるかを選びます。
+3. 判断件数を選び、`AI仮想判断を実行`を押します。
+4. 結果はexpanderで確認します。
+5. `仮想成績`タブでopen仮想取引の結果を後追い更新します。
+
+AIに渡す情報:
+
+- GPT判断時点の銘柄名、価格、固定スコア、entry_type、買い条件、損切り、利確目安、判定理由などを`market_snapshot_json`として保存します。
+- 未来データは判断時点では渡しません。
+- 1時間後、当日終値、1営業日後、3営業日後、5営業日後の検証は、後から`outcome_tracker.py`が行います。
+- 同一ローソク内で利確と損切りが両方到達した場合は、保守的に損切り優先で判定します。
+
+OpenAI API:
+
+- ローカルでは`.env`、Streamlit CloudではSecretsに`OPENAI_API_KEY`を設定します。
+- AI仮想取引のモデルは`AI_VIRTUAL_MODEL`で指定できます。初期値は`gpt-5.5`です。
+- APIキーがない、またはAPI呼び出しに失敗した場合は、アプリが落ちないようにルールベースの仮想判断へフォールバックします。
+- APIキーや秘密情報は画面、ログ、DBに表示しません。
+
+成績表示:
+
+- `仮想成績`タブで仮想取引の件数、open件数、勝率、平均リターンを確認できます。
+- `パターン別勝率`タブでentry_type別、銘柄別、地合い別の勝率、平均利益、平均損失、期待値を確認できます。
+- `銘柄別クセ`タブで銘柄ごとの得意パターン、苦手パターン、最適保有期間、注意点を確認できます。
+- サンプル数が30未満なら「仮説」、50未満なら「参考」、50以上で「信頼度 中」、100以上で「信頼度 高」と表示します。
+
 ## バックテスト
 
 簡易バックテストはローカルで以下を実行します。
@@ -369,9 +426,9 @@ python backtest.py
 
 ## MVPで未実装または簡易実装の部分
 
-- 外部通知は未実装です。
+- Discord通知は実装済みです。Gmail、LINE系通知は未実装です。
 - バックテストは簡易実装です。
 - J-Quants API接続は未実装です。
 - 地合いフィルターは個別銘柄トレンドによる仮スコアです。
-- Cloud上の`trades.csv`と`alerts_log.csv`は永続保存ではありません。
+- Cloud上の`trades.csv`、`alerts_log.csv`、`virtual_trades.db`は永続保存ではありません。
 - OpenAI APIが使えない場合はルールベースコメントに自動フォールバックします。

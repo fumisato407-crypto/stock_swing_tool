@@ -13,6 +13,8 @@ __pycache__/
 .coverage
 streamlit*.log
 alerts_log.csv
+virtual_trades.db
+virtual_trades.db-*
 .streamlit/secrets.toml
 secrets.toml
 .DS_Store

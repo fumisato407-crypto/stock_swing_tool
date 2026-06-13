@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List
 
-from config import OPENAI_API_KEY, OPENAI_MODEL
+from config import AI_VIRTUAL_MODEL, OPENAI_API_KEY, OPENAI_MODEL, get_setting
 
 
 def _rule_based_comment(signal: Dict[str, Any]) -> str:
@@ -120,3 +122,159 @@ def generate_hyena_comment(signal: Dict[str, Any]) -> str:
         except Exception:
             return _rule_based_comment(signal)
     return _rule_based_comment(signal)
+
+
+VIRTUAL_DECISIONS = {"virtual_buy", "virtual_watch", "virtual_avoid"}
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return [str(value)]
+
+
+def build_market_snapshot(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a point-in-time snapshot for AI paper trading without future data."""
+    return {
+        "timestamp_basis": signal.get("last_date") or signal.get("last_time") or "",
+        "code": signal.get("code", ""),
+        "name": signal.get("name", ""),
+        "price": signal.get("price", signal.get("current_price")),
+        "score": signal.get("score", signal.get("intraday_score", 0)),
+        "category": signal.get("category", signal.get("judgement", "")),
+        "entry_type": signal.get("entry_type", signal.get("signal_type", "")),
+        "entry_zone": signal.get("entry_zone", signal.get("buy_zone", "")),
+        "stop_loss": signal.get("stop_loss"),
+        "target_1": signal.get("target_1", signal.get("take_profit_1")),
+        "target_2": signal.get("target_2", signal.get("take_profit_2")),
+        "risk_reward": signal.get("risk_reward", ""),
+        "confidence": signal.get("confidence", ""),
+        "score_breakdown": signal.get("score_breakdown", {}),
+        "positive_reasons": _safe_list(signal.get("positive_reasons", signal.get("reasons", []))),
+        "negative_reasons": _safe_list(signal.get("negative_reasons", signal.get("risk_notes", []))),
+        "wait_reasons": _safe_list(signal.get("wait_reasons", [])),
+        "no_buy_conditions": signal.get("no_buy_conditions", ""),
+        "raw_metrics": signal.get("raw_metrics", {}),
+    }
+
+
+def _fallback_virtual_decision(signal: Dict[str, Any]) -> Dict[str, Any]:
+    score = int(_num(signal.get("score", signal.get("intraday_score", 0))))
+    price = _num(signal.get("price", signal.get("current_price", 0)))
+    entry_type = str(signal.get("entry_type", signal.get("signal_type", "仮想押し目")) or "仮想押し目")
+    stop_loss = _num(signal.get("stop_loss"), price * 0.97 if price else 0)
+    take_profit = _num(signal.get("target_1", signal.get("take_profit_1")), price * 1.04 if price else 0)
+
+    if score >= 70:
+        decision = "virtual_buy"
+        confidence = "中"
+    elif score >= 60:
+        decision = "virtual_watch"
+        confidence = "低〜中"
+    else:
+        decision = "virtual_avoid"
+        confidence = "低"
+
+    return {
+        "decision": decision,
+        "entry_type": entry_type,
+        "confidence": confidence,
+        "entry_price": price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "max_hold_days": 5,
+        "reasons": _safe_list(signal.get("positive_reasons", signal.get("reasons", [])))[:5]
+        or ["固定スコアと現在のテクニカル条件から仮想判断"],
+        "risk_factors": _safe_list(signal.get("negative_reasons", signal.get("risk_notes", [])))[:5]
+        or ["出来高不足、地合い悪化、想定ライン割れ"],
+        "model_used": "rule_based_fallback",
+        "is_ai_generated": False,
+    }
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.S)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _validate_virtual_decision(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    decision = str(raw.get("decision", fallback["decision"]))
+    if decision not in VIRTUAL_DECISIONS:
+        decision = fallback["decision"]
+
+    return {
+        "decision": decision,
+        "entry_type": str(raw.get("entry_type") or fallback["entry_type"]),
+        "confidence": str(raw.get("confidence") or fallback["confidence"]),
+        "entry_price": _num(raw.get("entry_price"), fallback["entry_price"]),
+        "stop_loss": _num(raw.get("stop_loss"), fallback["stop_loss"]),
+        "take_profit": _num(raw.get("take_profit"), fallback["take_profit"]),
+        "max_hold_days": int(_num(raw.get("max_hold_days"), fallback["max_hold_days"])),
+        "reasons": _safe_list(raw.get("reasons")) or fallback["reasons"],
+        "risk_factors": _safe_list(raw.get("risk_factors")) or fallback["risk_factors"],
+        "model_used": str(raw.get("model_used") or get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)),
+        "is_ai_generated": bool(raw.get("is_ai_generated", True)),
+    }
+
+
+def judge_virtual_trade(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe virtual trading decision. This never places real orders."""
+    fallback = _fallback_virtual_decision(signal)
+    api_key = get_setting("OPENAI_API_KEY", "")
+    if not api_key:
+        return fallback
+
+    snapshot = build_market_snapshot(signal)
+    prompt = f"""
+あなたは日本株のpaper trading / virtual trading専用の検証エンジンです。
+実売買推奨、発注、自動売買の指示は絶対にしません。
+以下の時点スナップショットだけを使い、未来データを仮定せず、仮想取引判断をJSONだけで返してください。
+
+decisionは必ず virtual_buy / virtual_watch / virtual_avoid のどれかです。
+virtual_buyは検証用の仮想ポジション作成に使います。
+virtual_watch / virtual_avoid は判断ログとして保存します。
+
+返答JSONのキー:
+decision, entry_type, confidence, entry_price, stop_loss, take_profit,
+max_hold_days, reasons, risk_factors
+
+スナップショット:
+{json.dumps(snapshot, ensure_ascii=False, default=str)}
+"""
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, timeout=20)
+        response = client.responses.create(
+            model=get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL),
+            input=prompt.strip(),
+            max_output_tokens=700,
+        )
+        parsed = _extract_json_object(response.output_text)
+        parsed["model_used"] = get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)
+        parsed["is_ai_generated"] = True
+        return _validate_virtual_decision(parsed, fallback)
+    except Exception:
+        return fallback

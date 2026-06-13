@@ -14,6 +14,9 @@ from config import ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, get_setti
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from notifier import format_yen
+from outcome_tracker import update_open_virtual_trade_outcomes
+from paper_trader import process_virtual_trade_signals
+from pattern_stats import calculate_pattern_stats
 from scanner import (
     append_trade_candidate,
     build_signal_table,
@@ -22,6 +25,8 @@ from scanner import (
     scan_watchlist,
 )
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD
+from stock_personality import generate_stock_personalities
+from virtual_trade_store import load_virtual_trades, rows_to_display
 
 st.set_page_config(
     page_title="日本株 1〜5日スイング候補ツール",
@@ -838,7 +843,7 @@ def _render_alerts_log() -> None:
         if log_df.empty:
             st.info("通知履歴はまだありません。")
         else:
-            st.dataframe(log_df.tail(100).iloc[::-1], width="stretch", hide_index=True)
+            st.dataframe(_safe_dataframe(log_df.tail(100).iloc[::-1]), width="stretch", hide_index=True)
 
 
 def _render_fetch_test() -> None:
@@ -1040,11 +1045,198 @@ def _render_intraday_tab(
 
     with st.expander("PC向け一覧表", expanded=False):
         if results:
-            st.dataframe(_intraday_table(results), width="stretch", hide_index=True)
+            st.dataframe(_safe_dataframe(_intraday_table(results)), width="stretch", hide_index=True)
         else:
             st.info("更新ボタンを押すと一覧を表示します。")
 
     _render_alerts_log()
+
+
+def _safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.fillna("").astype(str)
+
+
+def _ai_candidate_table(signals: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for signal in signals:
+        rows.append(
+            {
+                "code": signal.get("code", ""),
+                "name": signal.get("name", ""),
+                "price": format_yen(signal.get("price", signal.get("current_price"))),
+                "score": signal.get("score", signal.get("intraday_score", 0)),
+                "category": signal.get("category", signal.get("judgement", "")),
+                "entry_type": signal.get("entry_type", signal.get("signal_type", "")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_virtual_trade_result(result: Dict[str, Any], idx: int) -> None:
+    record = result.get("record", {})
+    decision = result.get("decision", {})
+    title = (
+        f"{record.get('symbol', record.get('code', '-'))} {record.get('name', '')}"
+        f"｜{decision.get('decision', '-')}"
+        f"｜{decision.get('entry_type', '-')}"
+        f"｜{'保存' if result.get('saved') else result.get('reason', '-')}"
+    )
+    with st.expander(title, expanded=False):
+        cols = st.columns(4)
+        cols[0].metric("仮想判断", decision.get("decision", "-"))
+        cols[1].metric("確度", decision.get("confidence", "-"))
+        cols[2].metric("仮想買値", format_yen(decision.get("entry_price")))
+        cols[3].metric("最大保有", f"{decision.get('max_hold_days', '-')}日")
+        st.markdown(f"**損切り**：{format_yen(decision.get('stop_loss'))}")
+        st.markdown(f"**利確**：{format_yen(decision.get('take_profit'))}")
+        _render_reason_list("理由", decision.get("reasons"))
+        _render_reason_list("リスク", decision.get("risk_factors"))
+        st.caption(f"保存結果: {result.get('reason', '-')}")
+
+
+def _render_ai_virtual_trade_tab(
+    buy: List[Dict[str, Any]],
+    watch: List[Dict[str, Any]],
+) -> None:
+    st.subheader("AI仮想取引")
+    st.caption("GPTによるpaper trading / virtual trading専用です。実売買・発注・自動売買は行いません。")
+
+    api_configured = bool(get_setting("OPENAI_API_KEY", "").strip())
+    st.caption(f"OpenAI API設定：{'あり' if api_configured else 'なし（ルールベースで仮想判断）'}")
+    st.caption(f"AI仮想取引モデル：{get_setting('AI_VIRTUAL_MODEL', 'gpt-5.5')}")
+
+    trades = load_virtual_trades(limit=1000)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("仮想ログ", len(trades))
+    metric_cols[1].metric("open", int((trades["status"] == "open").sum()) if not trades.empty else 0)
+    metric_cols[2].metric("closed", int((trades["status"] == "closed").sum()) if not trades.empty else 0)
+    metric_cols[3].metric("logged", int((trades["status"] == "logged").sum()) if not trades.empty else 0)
+
+    include_watch = st.checkbox("監視銘柄もAI仮想判断に含める", value=False)
+    max_candidates = st.selectbox("AI仮想判断する件数", [1, 3, 5, 10], index=1)
+    candidates = list(buy) + (list(watch) if include_watch else [])
+    candidates = sorted(candidates, key=lambda item: _score(item), reverse=True)[: int(max_candidates)]
+
+    st.markdown("**今回のAI仮想判断候補**")
+    if candidates:
+        st.dataframe(_safe_dataframe(_ai_candidate_table(candidates)), width="stretch", hide_index=True)
+    else:
+        st.info("AI仮想判断できる候補がありません。")
+
+    if st.button("AI仮想判断を実行", type="primary", disabled=not candidates):
+        with st.spinner("AI仮想取引判断を作成して保存中です..."):
+            results = process_virtual_trade_signals(candidates)
+        saved_count = sum(1 for result in results if result.get("saved"))
+        st.success(f"{saved_count}件を仮想取引DBに保存しました。")
+        for idx, result in enumerate(results):
+            _render_virtual_trade_result(result, idx)
+
+    if st.button("open仮想取引の結果を更新"):
+        with st.spinner("仮想取引の結果を追跡中です..."):
+            summary = update_open_virtual_trade_outcomes()
+        st.info(
+            f"確認 {summary['checked']}件 / 更新 {summary['updated']}件 / スキップ {summary['skipped']}件"
+        )
+
+    with st.expander("最近のAI仮想取引ログ", expanded=False):
+        recent = rows_to_display(load_virtual_trades(limit=100))
+        if recent.empty:
+            st.info("まだAI仮想取引ログはありません。")
+        else:
+            columns = [
+                "timestamp",
+                "symbol",
+                "name",
+                "decision",
+                "entry_type",
+                "confidence",
+                "entry_price",
+                "stop_loss",
+                "take_profit",
+                "source_score",
+                "status",
+            ]
+            st.dataframe(_safe_dataframe(recent[[col for col in columns if col in recent.columns]]), width="stretch", hide_index=True)
+
+
+def _render_virtual_performance_tab() -> None:
+    st.subheader("仮想成績")
+    st.caption("AI仮想取引の保存結果を後追いで検証します。実売買の履歴とは完全に分離しています。")
+    if st.button("仮想成績を更新"):
+        summary = update_open_virtual_trade_outcomes()
+        st.info(f"確認 {summary['checked']}件 / 更新 {summary['updated']}件 / スキップ {summary['skipped']}件")
+
+    trades = load_virtual_trades(limit=1000)
+    if trades.empty:
+        st.info("まだ仮想取引データはありません。")
+        return
+
+    returns = pd.to_numeric(trades["return_pct"], errors="coerce").dropna()
+    cols = st.columns(4)
+    cols[0].metric("総ログ", len(trades))
+    cols[1].metric("open", int((trades["status"] == "open").sum()))
+    cols[2].metric("評価済み", len(returns))
+    cols[3].metric("平均リターン", f"{returns.mean():.2f}%" if not returns.empty else "-")
+
+    with st.expander("仮想取引一覧", expanded=False):
+        show_cols = [
+            "timestamp",
+            "symbol",
+            "name",
+            "decision",
+            "entry_type",
+            "entry_price",
+            "return_pct",
+            "max_profit_pct",
+            "max_drawdown_pct",
+            "outcome",
+            "status",
+        ]
+        st.dataframe(_safe_dataframe(rows_to_display(trades)[[col for col in show_cols if col in trades.columns]]), width="stretch", hide_index=True)
+
+
+def _render_pattern_stats_tab() -> None:
+    st.subheader("パターン別勝率")
+    st.caption("サンプル数が30未満は仮説、50未満は参考、50以上で信頼度を表示します。")
+    stats = calculate_pattern_stats()
+    sections = [
+        ("entry_type別", stats.get("by_entry_type", pd.DataFrame())),
+        ("symbol別", stats.get("by_symbol", pd.DataFrame())),
+        ("地合い別", stats.get("by_market", pd.DataFrame())),
+    ]
+    for title, df in sections:
+        with st.expander(title, expanded=title == "entry_type別"):
+            if df.empty:
+                st.info("評価済みサンプルがまだありません。")
+            else:
+                st.dataframe(_safe_dataframe(df), width="stretch", hide_index=True)
+
+
+def _render_stock_personality_tab() -> None:
+    st.subheader("銘柄別クセ")
+    st.caption("仮想取引の検証結果から、得意パターン・苦手パターン・最適保有目安をまとめます。")
+    personalities = generate_stock_personalities()
+    if personalities.empty:
+        st.info("銘柄別クセを出すには、評価済みの仮想取引サンプルが必要です。")
+        return
+    for row in personalities.to_dict("records"):
+        title = (
+            f"{row.get('symbol')} {row.get('name', '')}"
+            f"｜期待値 {row.get('expected_value_pct')}%"
+            f"｜{row.get('reliability')}"
+        )
+        with st.expander(title, expanded=False):
+            cols = st.columns(4)
+            cols[0].metric("サンプル", row.get("sample_count"))
+            cols[1].metric("勝率", f"{row.get('win_rate_pct')}%")
+            cols[2].metric("期待値", f"{row.get('expected_value_pct')}%")
+            cols[3].metric("平均逆行", f"{row.get('avg_drawdown_pct')}%")
+            st.markdown(f"**得意パターン**：{row.get('good_patterns')}")
+            st.markdown(f"**苦手パターン**：{row.get('weak_patterns')}")
+            st.markdown(f"**最適保有目安**：{row.get('best_hold_period')}")
+            st.markdown(f"**注意点**：{row.get('caution')}")
 
 
 def _render_trades() -> None:
@@ -1059,7 +1251,7 @@ def _render_trades() -> None:
     if trades.empty:
         st.info("まだ記録はありません。候補の詳細から記録できます。")
     else:
-        st.dataframe(trades, width="stretch", hide_index=True)
+        st.dataframe(_safe_dataframe(trades), width="stretch", hide_index=True)
 
 
 def main() -> None:
@@ -1104,10 +1296,29 @@ def main() -> None:
         tab_watch,
         tab_avoid,
         tab_intraday,
+        tab_ai_virtual,
+        tab_virtual_performance,
+        tab_stock_personality,
+        tab_pattern_stats,
         tab_details,
         tab_watchlist,
         tab_trades,
-    ) = st.tabs(["サマリー", "買い候補", "監視", "触らない", "場中エントリー監視", "詳細分析", "監視リスト", "検証結果"])
+    ) = st.tabs(
+        [
+            "サマリー",
+            "買い候補",
+            "監視",
+            "触らない",
+            "場中エントリー監視",
+            "AI仮想取引",
+            "仮想成績",
+            "銘柄別クセ",
+            "パターン別勝率",
+            "詳細分析",
+            "監視リスト",
+            "検証結果",
+        ]
+    )
 
     with tab_summary:
         _render_summary_tab(buy, watch, avoid, failed)
@@ -1124,12 +1335,24 @@ def main() -> None:
     with tab_intraday:
         _render_intraday_tab(watchlist, buy, watch)
 
+    with tab_ai_virtual:
+        _render_ai_virtual_trade_tab(buy, watch)
+
+    with tab_virtual_performance:
+        _render_virtual_performance_tab()
+
+    with tab_stock_personality:
+        _render_stock_personality_tab()
+
+    with tab_pattern_stats:
+        _render_pattern_stats_tab()
+
     with tab_details:
         _render_details_tab(buy, watch, avoid, failed)
 
     with tab_watchlist:
         st.subheader("watchlist.csvの銘柄一覧")
-        st.dataframe(watchlist, width="stretch", hide_index=True)
+        st.dataframe(_safe_dataframe(watchlist), width="stretch", hide_index=True)
 
     with tab_trades:
         _render_trades()
