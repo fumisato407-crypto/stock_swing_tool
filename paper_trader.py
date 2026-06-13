@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from ai_judge import build_market_snapshot, judge_virtual_trade
+from config import VIRTUAL_TRADES_DB_PATH
 from data_fetcher import normalize_jp_symbol
 from virtual_trade_store import find_recent_virtual_trade, insert_virtual_trade
 
@@ -50,9 +51,16 @@ def process_virtual_trade_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = build_market_snapshot(signal)
     decision = judge_virtual_trade(signal)
     record = build_virtual_trade_record(signal, decision, snapshot)
+    db_path = str(VIRTUAL_TRADES_DB_PATH)
 
     if not record["symbol"]:
-        return {"saved": False, "reason": "symbol_missing", "decision": decision, "record": record}
+        return {
+            "saved": False,
+            "reason": "symbol_missing",
+            "decision": decision,
+            "record": record,
+            "db_path": db_path,
+        }
 
     duplicate = find_recent_virtual_trade(
         symbol=record["symbol"],
@@ -60,10 +68,24 @@ def process_virtual_trade_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         minutes=DUPLICATE_COOLDOWN_MINUTES,
     )
     if duplicate:
-        return {"saved": False, "reason": "duplicate_recent", "decision": decision, "record": record}
+        return {
+            "saved": False,
+            "reason": "duplicate_recent",
+            "duplicate_id": duplicate.get("id"),
+            "decision": decision,
+            "record": record,
+            "db_path": db_path,
+        }
 
     trade_id = insert_virtual_trade(record)
-    return {"saved": True, "reason": "saved", "trade_id": trade_id, "decision": decision, "record": record}
+    return {
+        "saved": True,
+        "reason": "saved",
+        "trade_id": trade_id,
+        "db_path": db_path,
+        "decision": decision,
+        "record": record,
+    }
 
 
 def process_virtual_trade_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -76,8 +98,10 @@ def process_virtual_trade_signals(signals: List[Dict[str, Any]]) -> List[Dict[st
                 {
                     "saved": False,
                     "reason": f"error:{exc.__class__.__name__}",
+                    "error_message": str(exc),
                     "decision": {},
                     "record": {"code": signal.get("code"), "name": signal.get("name")},
+                    "db_path": str(VIRTUAL_TRADES_DB_PATH),
                 }
             )
     return results

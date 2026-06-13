@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from alert_builder import alert_key, append_alert_log, build_buy_candidate_discord_text, send_discord_webhook
-from config import ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, get_setting
+from config import ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, VIRTUAL_TRADES_DB_PATH, get_setting
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from notifier import format_yen
@@ -1096,6 +1096,70 @@ def _render_virtual_trade_result(result: Dict[str, Any], idx: int) -> None:
         st.caption(f"保存結果: {result.get('reason', '-')}")
 
 
+def _virtual_result_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for result in results:
+        decision = result.get("decision") or {}
+        record = result.get("record") or {}
+        rows.append(
+            {
+                "saved": result.get("saved", False),
+                "reason": result.get("reason", ""),
+                "error_message": result.get("error_message", ""),
+                "trade_id": result.get("trade_id", ""),
+                "duplicate_id": result.get("duplicate_id", ""),
+                "db_path": result.get("db_path", str(VIRTUAL_TRADES_DB_PATH)),
+                "symbol": record.get("symbol") or record.get("code") or "",
+                "name": record.get("name", ""),
+                "decision": decision.get("decision", record.get("decision", "")),
+                "entry_type": decision.get("entry_type", record.get("entry_type", "")),
+                "source_score": record.get("source_score", ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_last_ai_virtual_run() -> None:
+    run_state = st.session_state.get("last_ai_virtual_run")
+    results = st.session_state.get("last_ai_virtual_results", [])
+    if not run_state:
+        return
+
+    st.markdown("**直近のAI仮想判断実行結果**")
+    st.info(f"ボタン押下を検知しました（{run_state.get('timestamp', '-')}）")
+    st.write(f"候補数: {run_state.get('candidate_count', 0)}")
+
+    if run_state.get("error"):
+        st.error(run_state.get("error"))
+
+    saved_count = int(run_state.get("saved_count", 0))
+    failed_count = int(run_state.get("failed_count", 0))
+    st.success(f"保存成功: {saved_count}件 / 失敗: {failed_count}件")
+
+    if results:
+        result_table = _virtual_result_table(results)
+        failed = result_table[result_table["saved"].astype(str) != "True"]
+        if not failed.empty:
+            st.warning("保存できなかった候補があります。reasonを確認してください。")
+            st.dataframe(
+                _safe_dataframe(failed[["symbol", "name", "reason", "error_message", "duplicate_id"]]),
+                width="stretch",
+                hide_index=True,
+            )
+        st.dataframe(_safe_dataframe(result_table), width="stretch", hide_index=True)
+        with st.expander("process_virtual_trade_signals の戻り値", expanded=False):
+            st.json(results)
+    else:
+        st.warning("process_virtual_trade_signals の戻り値は空です。")
+
+    recent_records = st.session_state.get("last_ai_virtual_recent", [])
+    st.markdown("**保存後に再取得した最近のAI仮想取引ログ**")
+    if recent_records:
+        st.dataframe(_safe_dataframe(pd.DataFrame(recent_records)), width="stretch", hide_index=True)
+    else:
+        st.info("保存後に再取得した最近ログは空です。")
+
+
 def _render_ai_virtual_trade_tab(
     buy: List[Dict[str, Any]],
     watch: List[Dict[str, Any]],
@@ -1124,16 +1188,49 @@ def _render_ai_virtual_trade_tab(
         st.dataframe(_safe_dataframe(_ai_candidate_table(candidates)), width="stretch", hide_index=True)
     else:
         st.info("AI仮想判断できる候補がありません。")
+    st.caption(f"候補数: {len(candidates)} / 仮想取引DB: {VIRTUAL_TRADES_DB_PATH}")
 
-    if st.button("AI仮想判断を実行", type="primary", disabled=not candidates):
-        with st.spinner("AI仮想取引判断を作成して保存中です..."):
-            results = process_virtual_trade_signals(candidates)
-        saved_count = sum(1 for result in results if result.get("saved"))
-        st.success(f"{saved_count}件を仮想取引DBに保存しました。")
-        for idx, result in enumerate(results):
-            _render_virtual_trade_result(result, idx)
+    run_clicked = st.button(
+        "AI仮想判断を実行",
+        key="run_ai_virtual_trade_button",
+        type="primary",
+        disabled=not candidates,
+    )
+    if run_clicked:
+        run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.info("ボタン押下を検知しました")
+        st.write(f"候補数: {len(candidates)}")
+        try:
+            with st.spinner("AI仮想取引判断を作成して保存中です..."):
+                results = process_virtual_trade_signals(candidates)
+            saved_count = sum(1 for result in results if result.get("saved"))
+            failed_count = len(results) - saved_count
+            recent_after = rows_to_display(load_virtual_trades(limit=10))
+            st.session_state["last_ai_virtual_results"] = results
+            st.session_state["last_ai_virtual_recent"] = recent_after.to_dict("records")
+            st.session_state["last_ai_virtual_run"] = {
+                "timestamp": run_timestamp,
+                "candidate_count": len(candidates),
+                "saved_count": saved_count,
+                "failed_count": failed_count,
+                "error": "",
+            }
+        except Exception as exc:
+            st.session_state["last_ai_virtual_results"] = []
+            st.session_state["last_ai_virtual_recent"] = rows_to_display(load_virtual_trades(limit=10)).to_dict("records")
+            st.session_state["last_ai_virtual_run"] = {
+                "timestamp": run_timestamp,
+                "candidate_count": len(candidates),
+                "saved_count": 0,
+                "failed_count": len(candidates),
+                "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}",
+            }
+            st.error("AI仮想判断中に例外が発生しました。")
+            st.exception(exc)
 
-    if st.button("open仮想取引の結果を更新"):
+    _render_last_ai_virtual_run()
+
+    if st.button("open仮想取引の結果を更新", key="update_virtual_outcomes_button"):
         with st.spinner("仮想取引の結果を追跡中です..."):
             summary = update_open_virtual_trade_outcomes()
         st.info(
