@@ -38,7 +38,7 @@ from scanner import (
 )
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD
 from stock_personality import generate_stock_personalities
-from time_utils import now_jst_display, now_jst_iso
+from time_utils import now_jst_display, now_jst_iso, parse_trade_datetime_to_jst_naive
 from virtual_trade_store import (
     get_virtual_database_list,
     insert_virtual_trade,
@@ -1219,6 +1219,215 @@ def _virtual_result_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _format_trade_datetime(value: Any) -> str:
+    parsed = parse_trade_datetime_to_jst_naive(value)
+    if parsed is None:
+        return str(value or "-")
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_score_value(value: Any) -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return "-"
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _format_pct_value(value: Any) -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return "-"
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{number:+.1f}%"
+
+
+def _format_elapsed_days(value: Any) -> str:
+    parsed = parse_trade_datetime_to_jst_naive(value)
+    if parsed is None:
+        return "-"
+    elapsed = max(0, (market_now_jst().replace(tzinfo=None) - parsed).days)
+    return f"{elapsed}日"
+
+
+def _display_decision(value: Any) -> str:
+    return {
+        "virtual_buy": "仮想買い",
+        "virtual_watch": "仮想監視",
+        "virtual_avoid": "見送り",
+    }.get(str(value or ""), str(value or "-"))
+
+
+def _display_status(value: Any) -> str:
+    return {
+        "open": "保有中",
+        "closed": "終了",
+        "logged": "記録のみ",
+    }.get(str(value or ""), str(value or "-"))
+
+
+def _display_outcome(value: Any) -> str:
+    return {
+        "tracking": "検証中",
+        "stop_loss": "損切り",
+        "take_profit": "利確",
+        "time_exit_5d": "5日経過",
+    }.get(str(value or ""), str(value or "-") if value not in (None, "") else "-")
+
+
+def _display_judge_method(judge_source: Any, model_used: Any = "") -> str:
+    source = str(judge_source or "").lower()
+    model = str(model_used or "").lower()
+    if source == "gpt" or (model and model != "rule_based_fallback" and "fallback" not in model):
+        return "GPT"
+    if source == "fallback" or model == "rule_based_fallback":
+        return "ルールベース"
+    if source == "test":
+        return "テスト"
+    return "-"
+
+
+def _display_target_mode(value: Any) -> str:
+    return "買い候補＋監視" if str(value) == "buy_watch" else "買い候補のみ"
+
+
+def _display_bool(value: Any) -> str:
+    return "ON" if bool(value) else "OFF"
+
+
+def _virtual_trade_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "仮想買い時刻",
+                "銘柄",
+                "判定",
+                "型",
+                "買値",
+                "損切り",
+                "利確目標",
+                "スコア",
+                "状態",
+                "現在結果",
+                "最大利益率",
+                "最大下落率",
+                "判定方式",
+            ]
+        )
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", "") or "")
+        name = str(row.get("name", "") or "")
+        rows.append(
+            {
+                "仮想買い時刻": _format_trade_datetime(row.get("timestamp_jst") or row.get("timestamp")),
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "判定": _display_decision(row.get("decision")),
+                "型": row.get("entry_type") or "-",
+                "買値": format_yen(row.get("entry_price")),
+                "損切り": format_yen(row.get("stop_loss")),
+                "利確目標": format_yen(row.get("take_profit")),
+                "スコア": _format_score_value(row.get("source_score")),
+                "状態": _display_status(row.get("status")),
+                "現在結果": _display_outcome(row.get("outcome")),
+                "最大利益率": _format_pct_value(row.get("max_profit_pct")),
+                "最大下落率": _format_pct_value(row.get("max_drawdown_pct")),
+                "判定方式": _display_judge_method(row.get("judge_source"), row.get("model_used")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _operational_virtual_trades(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    filtered = df.copy()
+    if "judge_source" in filtered.columns:
+        filtered = filtered[filtered["judge_source"].astype(str) != "test"]
+    if "symbol" in filtered.columns:
+        filtered = filtered[filtered["symbol"].astype(str) != "DB_TEST"]
+    if "entry_type" in filtered.columns:
+        filtered = filtered[filtered["entry_type"].astype(str) != "db_connection_test"]
+    return filtered
+
+
+def _open_virtual_trade_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["仮想買い時刻", "銘柄", "型", "買値", "損切り", "利確目標", "スコア", "経過日数", "現在結果"])
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", "") or "")
+        name = str(row.get("name", "") or "")
+        rows.append(
+            {
+                "仮想買い時刻": _format_trade_datetime(row.get("timestamp_jst") or row.get("timestamp")),
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "型": row.get("entry_type") or "-",
+                "買値": format_yen(row.get("entry_price")),
+                "損切り": format_yen(row.get("stop_loss")),
+                "利確目標": format_yen(row.get("take_profit")),
+                "スコア": _format_score_value(row.get("source_score")),
+                "経過日数": _format_elapsed_days(row.get("timestamp_jst") or row.get("timestamp")),
+                "現在結果": _display_outcome(row.get("outcome")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _closed_virtual_trade_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["仮想買い時刻", "銘柄", "型", "買値", "結果", "リターン", "最大利益率", "最大下落率", "終了理由"])
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", "") or "")
+        name = str(row.get("name", "") or "")
+        rows.append(
+            {
+                "仮想買い時刻": _format_trade_datetime(row.get("timestamp_jst") or row.get("timestamp")),
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "型": row.get("entry_type") or "-",
+                "買値": format_yen(row.get("entry_price")),
+                "結果": _display_outcome(row.get("outcome")),
+                "リターン": _format_pct_value(row.get("return_pct")),
+                "最大利益率": _format_pct_value(row.get("max_profit_pct")),
+                "最大下落率": _format_pct_value(row.get("max_drawdown_pct")),
+                "終了理由": _display_outcome(row.get("outcome")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _filter_virtual_trades(df: pd.DataFrame, limit: int, status_label: str, query: str, entry_type: str, judge_method: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    filtered = df.copy()
+    if status_label == "保有中":
+        filtered = filtered[filtered["status"].astype(str) == "open"]
+    elif status_label == "終了":
+        filtered = filtered[filtered["status"].astype(str) == "closed"]
+
+    if query.strip():
+        needle = query.strip().lower()
+        haystack = (
+            filtered.get("symbol", pd.Series("", index=filtered.index)).astype(str)
+            + " "
+            + filtered.get("name", pd.Series("", index=filtered.index)).astype(str)
+        ).str.lower()
+        filtered = filtered[haystack.str.contains(re.escape(needle), na=False)]
+
+    if entry_type != "すべて" and "entry_type" in filtered.columns:
+        filtered = filtered[filtered["entry_type"].astype(str) == entry_type]
+
+    if judge_method != "すべて":
+        methods = filtered.apply(lambda row: _display_judge_method(row.get("judge_source"), row.get("model_used")), axis=1)
+        filtered = filtered[methods == judge_method]
+
+    return filtered.head(int(limit))
+
+
 def _render_last_ai_virtual_run() -> None:
     run_state = st.session_state.get("last_ai_virtual_run")
     results = st.session_state.get("last_ai_virtual_results", [])
@@ -1684,27 +1893,30 @@ def _run_rule_auto_log_once() -> Dict[str, Any]:
 
 
 def _render_rule_auto_log_status(summary: Dict[str, Any]) -> None:
-    st.caption(f"現在時刻JST：{summary.get('checked_at_jst', '-')}")
-    st.caption(f"市場ステータス：{summary.get('market_status', '-')}")
-    st.caption(f"自動保存：{'ON' if summary.get('auto_enabled') else 'OFF'}")
-    st.caption(f"実行間隔：{summary.get('interval_minutes', '-')}分")
-    st.caption(f"対象条件：{summary.get('target_mode', '-')}")
-    st.caption(f"最小スコア：{summary.get('min_score', '-')}")
-    st.caption(f"最大保存件数：{summary.get('max_count', '-')}")
-    st.caption(f"latest_signals件数：{summary.get('latest_signals_count', 0)}")
-    st.caption(f"最終自動保存時刻：{summary.get('last_auto_save_at', '-')}")
-    st.caption(f"次回実行予定：{summary.get('next_run_hint', '-')}")
-    st.caption(f"DBパス：{summary.get('db_path', VIRTUAL_TRADES_DB_PATH)}")
-
-    cols = st.columns(5)
-    cols[0].metric("対象候補数", summary.get("target_count", 0))
-    cols[1].metric("保存成功", summary.get("saved_count", 0))
-    cols[2].metric("保存失敗", summary.get("failed_count", 0))
-    cols[3].metric("duplicate", summary.get("duplicate_count", 0))
-    cols[4].metric("API calls", summary.get("openai_call_count", 0))
+    metrics = [
+        ("現在時刻", summary.get("checked_at_jst", "-")),
+        ("市場", summary.get("market_status", "-")),
+        ("自動保存", _display_bool(summary.get("auto_enabled"))),
+        ("間隔", f"{summary.get('interval_minutes', '-')}分"),
+        ("対象", _display_target_mode(summary.get("target_mode", "buy_only"))),
+        ("最小スコア", summary.get("min_score", "-")),
+        ("最大保存", f"{summary.get('max_count', '-')}件"),
+        ("スキャン候補", f"{summary.get('latest_signals_count', 0)}件"),
+        ("対象候補", f"{summary.get('target_count', 0)}件"),
+        ("最終保存", summary.get("last_auto_save_at", "-")),
+        ("次回予定", summary.get("next_run_hint", "-")),
+        ("保存成功", summary.get("saved_count", 0)),
+        ("重複スキップ", summary.get("duplicate_count", 0)),
+        ("保存失敗", summary.get("failed_count", 0)),
+        ("API calls", summary.get("openai_call_count", 0)),
+    ]
+    for start in range(0, len(metrics), 5):
+        cols = st.columns(5)
+        for col, (label, value) in zip(cols, metrics[start : start + 5]):
+            col.metric(label, value)
 
     if summary.get("reason") == "signals_missing":
-        st.warning("まだ株価スキャン結果がありません。先に株価スキャンを実行してください")
+        st.warning("まだスキャン結果がありません。先に『株価スキャンを実行』を押してください。")
     elif summary.get("reason") == "market_closed":
         st.info("市場時間外、昼休み、土日は自動保存を実行しません。")
     elif summary.get("reason") == "interval_wait":
@@ -1713,7 +1925,7 @@ def _render_rule_auto_log_status(summary: Dict[str, Any]) -> None:
         st.success("相場中ルール買いログ自動保存を実行しました。")
 
     if summary.get("last_error"):
-        st.error(summary["last_error"])
+        st.error(f"最終エラー: {summary['last_error']}")
 
 
 def _render_rule_auto_log_fragment() -> None:
@@ -1771,21 +1983,26 @@ def _render_rule_auto_log_test_result() -> None:
     if summary.get("error"):
         st.warning(summary["error"])
     st.caption(f"保存テスト時刻：{summary.get('timestamp_jst', '-')}")
-    st.caption(f"DBパス：{summary.get('db_path', '-')}")
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("対象候補", summary.get("selected_count", 0))
     cols[1].metric("保存成功", summary.get("saved_count", 0))
-    cols[2].metric("duplicate", summary.get("duplicate_count", 0))
+    cols[2].metric("重複スキップ", summary.get("duplicate_count", 0))
     cols[3].metric("保存失敗", summary.get("failed_count", 0))
+    cols[4].metric("API calls", int(st.session_state.get("openai_call_count", 0)))
 
 
 def _render_rule_auto_logger_section() -> None:
     st.markdown("**相場中ルール買いログ自動保存**")
     st.caption("画面を開いている間だけ、市場時間中にルールベースのpaper tradingログを保存します。実売買・発注は行いません。")
+    has_signals = bool(st.session_state.get("latest_signals"))
+    if not has_signals:
+        st.info("まだスキャン結果がありません。先に『株価スキャンを実行』を押してください。")
+        st.session_state["ai_virtual_logging_enabled"] = False
     auto_enabled = st.toggle(
         "相場中ルール買いログ自動保存",
         value=False,
         key="ai_virtual_logging_enabled",
+        disabled=not has_signals,
     )
     st.session_state["auto_run_enabled"] = bool(auto_enabled)
 
@@ -1809,12 +2026,122 @@ def _render_rule_auto_logger_section() -> None:
         st.selectbox("最小スコア", [70, 75, 80], index=0, key="ai_auto_min_score")
         st.selectbox("最大保存件数", [1, 3, 5, 10], index=1, key="gpt_max_candidates")
 
-    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
     st.caption("自動保存は安全運用のため常に rule_based_fallback で実行します。OpenAI APIは呼びません。")
-    if st.button("ルール買いログを1回だけ保存テスト", key="run_rule_buy_log_once_test_button"):
+    st.caption("相場時間外でも、現在のスキャン結果からルールベースで仮想ログを保存します。")
+    if st.button("手動で1回保存", key="run_rule_buy_log_once_test_button", disabled=not has_signals):
         _run_rule_auto_log_test_once()
     _render_rule_auto_log_test_result()
     _render_rule_auto_log_fragment()
+
+
+def _render_ai_operation_status(trades: pd.DataFrame) -> None:
+    st.markdown("**現在の運用状態**")
+    open_count = int((trades["status"] == "open").sum()) if not trades.empty and "status" in trades.columns else 0
+    closed_count = int((trades["status"] == "closed").sum()) if not trades.empty and "status" in trades.columns else 0
+    cols = st.columns(6)
+    cols[0].metric("OpenAI API", "ON" if _openai_api_enabled() else "OFF")
+    cols[1].metric("判定方式", "GPT" if _openai_api_enabled() else "ルールベース")
+    cols[2].metric("API calls", int(st.session_state.get("openai_call_count", 0)))
+    cols[3].metric("仮想ログ", len(trades))
+    cols[4].metric("open", open_count)
+    cols[5].metric("closed", closed_count)
+    if not _openai_api_enabled():
+        st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
+
+
+def _render_manual_virtual_judgement(
+    buy: List[Dict[str, Any]],
+    watch: List[Dict[str, Any]],
+    has_signals: bool,
+) -> None:
+    with st.expander("手動の仮想判断", expanded=False):
+        if not has_signals:
+            st.info("まだスキャン結果がありません。先に『株価スキャンを実行』を押してください。")
+        include_watch = st.checkbox("監視銘柄もAI仮想判断に含める", value=False, disabled=not has_signals)
+        max_candidates = st.selectbox("AI仮想判断する件数", [1, 3, 5, 10], index=1, disabled=not has_signals)
+        selected = list(buy) + (list(watch) if include_watch else [])
+        selected = sorted(selected, key=lambda item: _score(item), reverse=True)[: int(max_candidates)]
+        candidates_snapshot = _snapshot_ai_virtual_candidates(selected)
+        st.session_state["ai_virtual_candidates_snapshot"] = candidates_snapshot
+
+        if selected:
+            st.caption("今回の仮想判断候補")
+            st.dataframe(_safe_dataframe(_ai_candidate_table(selected)), width="stretch", hide_index=True)
+        elif has_signals:
+            st.info("AI仮想判断できる候補がありません。")
+
+        if not _openai_api_enabled():
+            st.caption("手動実行モード：rule_based_fallback（GPT判断なし）")
+        else:
+            st.caption("OpenAI API使用ONのため、手動実行ではGPT判定を使います。")
+        st.button(
+            "AI仮想判断を実行",
+            key="run_ai_virtual_trade_callback_button",
+            type="primary",
+            disabled=(not has_signals or not candidates_snapshot),
+            on_click=_on_ai_virtual_run_click,
+            args=(candidates_snapshot,),
+        )
+
+
+def _render_virtual_trade_log_tables(trades: pd.DataFrame) -> None:
+    st.markdown("**仮想買いログ一覧**")
+    if trades.empty:
+        st.info("まだ仮想買いログはありません。")
+        return
+
+    filter_cols = st.columns([1, 1, 1.4, 1.2, 1])
+    limit = filter_cols[0].selectbox("表示件数", [10, 30, 50, 100], index=1, key="virtual_log_limit")
+    status_label = filter_cols[1].selectbox("状態", ["すべて", "保有中", "終了"], index=0, key="virtual_log_status_filter")
+    query = filter_cols[2].text_input("銘柄検索", key="virtual_log_symbol_search")
+    entry_types = ["すべて"]
+    if "entry_type" in trades.columns:
+        entry_types += sorted([item for item in trades["entry_type"].dropna().astype(str).unique().tolist() if item])
+    entry_type = filter_cols[3].selectbox("型", entry_types, index=0, key="virtual_log_entry_type_filter")
+    judge_method = filter_cols[4].selectbox("判定方式", ["すべて", "ルールベース", "GPT"], index=0, key="virtual_log_judge_filter")
+
+    filtered = _filter_virtual_trades(trades, int(limit), status_label, query, entry_type, judge_method)
+    display = _virtual_trade_display_table(filtered)
+    st.dataframe(_safe_dataframe(display), width="stretch", hide_index=True)
+
+
+def _render_open_virtual_trades(trades: pd.DataFrame) -> None:
+    st.markdown("**open中の仮想取引**")
+    open_df = trades[trades["status"].astype(str) == "open"] if not trades.empty and "status" in trades.columns else pd.DataFrame()
+    if open_df.empty:
+        st.info("open中の仮想取引はありません。")
+        return
+    st.dataframe(_safe_dataframe(_open_virtual_trade_display_table(open_df)), width="stretch", hide_index=True)
+
+
+def _render_closed_virtual_trades(trades: pd.DataFrame) -> None:
+    st.markdown("**終了済みの仮想取引**")
+    closed_df = trades[trades["status"].astype(str) == "closed"] if not trades.empty and "status" in trades.columns else pd.DataFrame()
+    if closed_df.empty:
+        st.info("終了済みの仮想取引はありません。")
+        return
+    st.dataframe(_safe_dataframe(_closed_virtual_trade_display_table(closed_df)), width="stretch", hide_index=True)
+
+
+def _render_ai_debug_expander() -> None:
+    with st.expander("詳細デバッグ情報", expanded=False):
+        st.button(
+            "OpenAI接続テスト",
+            key="openai_connection_test_button",
+            on_click=_on_openai_connection_test_click,
+        )
+        _render_openai_connection_test_state()
+        st.button(
+            "DB疎通テスト",
+            key="ai_virtual_db_test_button",
+            on_click=_on_ai_virtual_db_test_click,
+        )
+        _render_ai_virtual_db_test_result()
+        _render_ai_virtual_callback_debug_state()
+        if st.button("open仮想取引の結果を更新", key="update_virtual_outcomes_button"):
+            with st.spinner("仮想取引の結果を追跡中です..."):
+                summary = update_open_virtual_trade_outcomes()
+            st.info(f"確認 {summary['checked']}件 / 更新 {summary['updated']}件 / スキップ {summary['skipped']}件")
 
 
 def _render_ai_virtual_trade_tab(
@@ -1824,98 +2151,15 @@ def _render_ai_virtual_trade_tab(
     st.subheader("AI仮想取引")
     st.caption("GPTによるpaper trading / virtual trading専用です。実売買・発注・自動売買は行いません。")
 
-    api_configured = bool(get_setting("OPENAI_API_KEY", "").strip())
-    st.caption(f"OpenAI APIキー：{'あり' if api_configured else 'なし'}")
-    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
-    st.caption(f"現在のAI仮想判断：{_openai_mode_label()}")
-    st.caption(f"API呼び出し回数：{int(st.session_state.get('openai_call_count', 0))}")
-    if not _openai_api_enabled():
-        st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
-    st.button(
-        "OpenAI接続テスト",
-        key="openai_connection_test_button",
-        on_click=_on_openai_connection_test_click,
-    )
-    _render_openai_connection_test_state()
-
-    trades = load_virtual_trades(limit=1000)
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("仮想ログ", len(trades))
-    metric_cols[1].metric("open", int((trades["status"] == "open").sum()) if not trades.empty else 0)
-    metric_cols[2].metric("closed", int((trades["status"] == "closed").sum()) if not trades.empty else 0)
-    metric_cols[3].metric("logged", int((trades["status"] == "logged").sum()) if not trades.empty else 0)
-
-    include_watch = st.checkbox("監視銘柄もAI仮想判断に含める", value=False)
-    max_candidates = st.selectbox("AI仮想判断する件数", [1, 3, 5, 10], index=1)
-    candidates = list(buy) + (list(watch) if include_watch else [])
-    candidates = sorted(candidates, key=lambda item: _score(item), reverse=True)[: int(max_candidates)]
-    candidates_snapshot = _snapshot_ai_virtual_candidates(candidates)
-    st.session_state["ai_virtual_candidates_snapshot"] = candidates_snapshot
-
-    st.markdown("**今回のAI仮想判断候補**")
-    if candidates:
-        st.dataframe(_safe_dataframe(_ai_candidate_table(candidates)), width="stretch", hide_index=True)
-    else:
-        st.info("AI仮想判断できる候補がありません。")
-    st.caption(f"候補数: {len(candidates)} / 仮想取引DB: {VIRTUAL_TRADES_DB_PATH}")
-
-    st.button(
-        "DB疎通テスト",
-        key="ai_virtual_db_test_button",
-        on_click=_on_ai_virtual_db_test_click,
-    )
-    _render_ai_virtual_db_test_result()
-
-    if not _openai_api_enabled():
-        st.caption("手動実行モード：rule_based_fallback（GPT判断なし）")
-    else:
-        st.caption("OpenAI API使用ONのため、手動実行ではGPT判定を使います。")
-    st.button(
-        "AI仮想判断を実行",
-        key="run_ai_virtual_trade_callback_button",
-        type="primary",
-        disabled=not candidates_snapshot,
-        on_click=_on_ai_virtual_run_click,
-        args=(candidates_snapshot,),
-    )
-
+    trades = _operational_virtual_trades(load_virtual_trades(limit=1000))
+    has_signals = bool(st.session_state.get("latest_signals"))
+    _render_ai_operation_status(trades)
+    _render_manual_virtual_judgement(buy, watch, has_signals)
     _render_rule_auto_logger_section()
-    _render_ai_virtual_callback_debug_state()
-    _render_last_ai_virtual_run()
-
-    if st.button("open仮想取引の結果を更新", key="update_virtual_outcomes_button"):
-        with st.spinner("仮想取引の結果を追跡中です..."):
-            summary = update_open_virtual_trade_outcomes()
-        st.info(
-            f"確認 {summary['checked']}件 / 更新 {summary['updated']}件 / スキップ {summary['skipped']}件"
-        )
-
-    with st.expander("最近のAI仮想取引ログ", expanded=False):
-        recent = rows_to_display(load_virtual_trades(limit=100))
-        if recent.empty:
-            st.info("まだAI仮想取引ログはありません。")
-        else:
-            columns = [
-                "timestamp_jst",
-                "timestamp",
-                "symbol",
-                "name",
-                "decision",
-                "entry_type",
-                "judge_source",
-                "model_used",
-                "is_ai_generated",
-                "fallback_reason",
-                "fallback_error_type",
-                "fallback_error_message",
-                "confidence",
-                "entry_price",
-                "stop_loss",
-                "take_profit",
-                "source_score",
-                "status",
-            ]
-            st.dataframe(_safe_dataframe(recent[[col for col in columns if col in recent.columns]]), width="stretch", hide_index=True)
+    _render_virtual_trade_log_tables(trades)
+    _render_open_virtual_trades(trades)
+    _render_closed_virtual_trades(trades)
+    _render_ai_debug_expander()
 
 
 def _render_virtual_performance_tab() -> None:
