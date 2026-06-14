@@ -415,6 +415,20 @@ OpenAI API:
 - APIキーはGitHubにコミットしないでください。`.env`と`.streamlit/secrets.toml`は`.gitignore`で除外します。
 - OpenAI APIキーなしで保存した仮想判断は、`judge_source=fallback`、`model_used=rule_based_fallback`、`is_ai_generated=0`として記録されます。
 
+相場中ルール買いログ自動保存:
+
+- 基本運用はOpenAI API使用OFFです。OFFならAPIキーが入っていてもGPT判断は呼ばず、API料金は発生しません。
+- `AI仮想取引`タブの`相場中ルール買いログ自動保存`をONにすると、Streamlit画面を開いている間だけ自動実行します。
+- 実行間隔は1分、3分、5分、10分から選べます。
+- 対象は`買い候補のみ`または`買い候補＋監視`から選べます。
+- 最小スコアと最大保存件数を設定し、条件に合う上位候補を`virtual_trades.db`へpaper tradingログとして保存します。
+- 自動保存は市場時間中だけ動きます。平日の前場09:00〜11:30、後場12:30〜15:30が対象で、昼休み、時間外、土日は停止します。祝日は今後対応予定です。
+- 自動保存は安全運用のため`rule_based_fallback`で実行します。`judge_source=fallback`、`model_used=rule_based_fallback`、`is_ai_generated=0`、`fallback_reason=openai_disabled`として保存されます。
+- 同一銘柄、同一entry_type、同一judge_sourceの短時間重複保存は30分抑制します。
+- これは実売買・自動売買・発注ではありません。検証用のpaper tradingです。
+- `trades.csv`とは混ぜません。AI仮想取引ログは`virtual_trades.db`に保存します。
+- Streamlit Cloud上のSQLiteは永続保存に向きません。本命の長時間運用は、将来的に`market_runner.py`でローカルPC常駐にする想定です。
+
 成績表示:
 
 - `仮想成績`タブで仮想取引の件数、open件数、勝率、平均リターンを確認できます。

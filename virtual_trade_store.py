@@ -206,6 +206,7 @@ def load_virtual_trades(
 def find_recent_virtual_trade(
     symbol: str,
     entry_type: str,
+    judge_source: str = "",
     minutes: int = 30,
     path: Path = VIRTUAL_TRADES_DB_PATH,
 ) -> Optional[Dict[str, Any]]:
@@ -213,15 +214,26 @@ def find_recent_virtual_trade(
     cutoff = parse_trade_datetime_to_jst_naive(now_jst_iso())
     cutoff_ts = cutoff.timestamp() - minutes * 60 if cutoff else datetime.now().timestamp() - minutes * 60
     with closing(_connect(path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM virtual_trades
-            WHERE symbol = ? AND entry_type = ?
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 20
-            """,
-            (symbol, entry_type),
-        ).fetchall()
+        if judge_source:
+            rows = conn.execute(
+                """
+                SELECT * FROM virtual_trades
+                WHERE symbol = ? AND entry_type = ? AND judge_source = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 20
+                """,
+                (symbol, entry_type, judge_source),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM virtual_trades
+                WHERE symbol = ? AND entry_type = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 20
+                """,
+                (symbol, entry_type),
+            ).fetchall()
         columns = [col[1] for col in conn.execute("PRAGMA table_info(virtual_trades)").fetchall()]
 
     for row in rows:

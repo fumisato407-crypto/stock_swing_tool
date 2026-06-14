@@ -23,6 +23,7 @@ from config import (
 )
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
+from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
 from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
@@ -1342,15 +1343,7 @@ def _on_openai_connection_test_click() -> None:
 
 
 def _render_openai_connection_test_state() -> None:
-    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
-    st.caption(f"現在のAI仮想判断：{_openai_mode_label()}")
-    if not _openai_api_enabled():
-        st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
     st.markdown("**OpenAI接続テスト**")
-    st.info("初期スキャンではOpenAI APIを呼びません。AI仮想判断ボタン、またはOpenAI接続テストを押した時だけ呼びます。")
-    st.caption(f"OPENAI_API_KEY設定状態：{'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
-    st.caption(f"AI_VIRTUAL_MODEL：{_current_ai_virtual_model()}")
-    st.caption(f"openai_call_count：{int(st.session_state.get('openai_call_count', 0))}")
     result = st.session_state.get("openai_test_result")
     if not result:
         st.info("まだOpenAI接続テストは実行していません。")
@@ -1550,6 +1543,220 @@ def _render_ai_virtual_callback_debug_state() -> None:
         st.error(f"直近ログ取得失敗: {exc.__class__.__name__}: {exc}")
 
 
+def _auto_market_now() -> datetime:
+    override = st.session_state.get("ai_auto_market_now_override")
+    if override:
+        try:
+            parsed = datetime.fromisoformat(str(override))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            return parsed.astimezone(ZoneInfo("Asia/Tokyo"))
+        except ValueError:
+            pass
+    return market_now_jst()
+
+
+def _select_rule_auto_log_candidates(
+    signals: List[Dict[str, Any]],
+    target_mode: str,
+    min_score: int,
+    max_count: int,
+) -> List[Dict[str, Any]]:
+    allowed_categories = {"買い候補"}
+    if target_mode == "buy_watch":
+        allowed_categories.add("監視")
+
+    candidates = [
+        signal
+        for signal in signals
+        if signal.get("category") in allowed_categories and _score(signal) >= int(min_score)
+    ]
+    return sorted(candidates, key=lambda item: _score(item), reverse=True)[: int(max_count)]
+
+
+def _summarize_virtual_trade_results(results: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "saved_count": sum(1 for result in results if result.get("saved")),
+        "failed_count": sum(1 for result in results if not result.get("saved")),
+        "duplicate_count": sum(1 for result in results if result.get("reason") == "duplicate_recent"),
+    }
+
+
+def _run_rule_auto_log_once() -> Dict[str, Any]:
+    now = _auto_market_now()
+    interval_minutes = int(st.session_state.get("gpt_interval_minutes", 1) or 1)
+    interval_seconds = interval_minutes * 60
+    target_mode = str(st.session_state.get("ai_auto_target_mode", "buy_only"))
+    min_score = int(st.session_state.get("ai_auto_min_score", 70) or 70)
+    max_count = int(st.session_state.get("gpt_max_candidates", 3) or 3)
+    enabled = bool(st.session_state.get("ai_virtual_logging_enabled", False))
+    st.session_state["auto_run_enabled"] = enabled
+    signals = list(st.session_state.get("latest_signals", []))
+    candidates = _select_rule_auto_log_candidates(signals, target_mode, min_score, max_count) if signals else []
+    last_attempt_epoch = st.session_state.get("ai_rule_auto_last_attempt_epoch")
+
+    summary: Dict[str, Any] = {
+        "checked_at_jst": now.strftime("%Y-%m-%d %H:%M:%S JST"),
+        "market_status": market_status_label(now),
+        "auto_enabled": enabled,
+        "interval_minutes": interval_minutes,
+        "target_mode": target_mode,
+        "min_score": min_score,
+        "max_count": max_count,
+        "last_auto_save_at": st.session_state.get("ai_rule_auto_last_save_at", "-"),
+        "next_run_hint": "-",
+        "target_count": len(candidates),
+        "saved_count": 0,
+        "failed_count": 0,
+        "duplicate_count": 0,
+        "openai_call_count": int(st.session_state.get("openai_call_count", 0)),
+        "last_error": "",
+        "status": "skipped",
+        "reason": "",
+    }
+
+    st.session_state["ai_rule_auto_last_check_at"] = summary["checked_at_jst"]
+
+    if enabled:
+        if is_market_open_jst(now):
+            base_epoch = float(last_attempt_epoch or now.timestamp())
+            next_dt = datetime.fromtimestamp(base_epoch + interval_seconds, tz=ZoneInfo("Asia/Tokyo"))
+            summary["next_run_hint"] = next_dt.strftime("%Y-%m-%d %H:%M:%S JST")
+        else:
+            summary["next_run_hint"] = next_market_open_hint(now)
+
+    if not enabled:
+        summary["reason"] = "auto_disabled"
+        st.session_state["ai_rule_auto_last_summary"] = summary
+        return summary
+    if not is_market_open_jst(now):
+        summary["reason"] = "market_closed"
+        st.session_state["ai_rule_auto_last_summary"] = summary
+        return summary
+    if not signals:
+        summary["reason"] = "signals_missing"
+        st.session_state["ai_rule_auto_last_error"] = "まだ株価スキャン結果がありません。先に株価スキャンを実行してください"
+        summary["last_error"] = st.session_state["ai_rule_auto_last_error"]
+        st.session_state["ai_rule_auto_last_summary"] = summary
+        return summary
+
+    now_epoch = now.timestamp()
+    if last_attempt_epoch and now_epoch - float(last_attempt_epoch) < interval_seconds:
+        summary["reason"] = "interval_wait"
+        st.session_state["ai_rule_auto_last_summary"] = summary
+        return summary
+
+    st.session_state["ai_rule_auto_last_attempt_epoch"] = now_epoch
+    next_dt = datetime.fromtimestamp(now_epoch + interval_seconds, tz=ZoneInfo("Asia/Tokyo"))
+    summary["next_run_hint"] = next_dt.strftime("%Y-%m-%d %H:%M:%S JST")
+    if not candidates:
+        summary["reason"] = "no_candidates"
+        st.session_state["ai_rule_auto_last_error"] = ""
+        st.session_state["ai_rule_auto_last_summary"] = summary
+        return summary
+
+    try:
+        results = process_virtual_trade_signals(candidates, use_openai=False)
+        counts = _summarize_virtual_trade_results(results)
+        summary.update(counts)
+        summary["status"] = "executed"
+        summary["reason"] = "saved" if counts["saved_count"] else "no_new_saved"
+        st.session_state["last_ai_virtual_results"] = results
+        st.session_state["ai_rule_auto_last_results"] = results
+        st.session_state["ai_rule_auto_last_save_at"] = summary["checked_at_jst"]
+        st.session_state["ai_rule_auto_last_error"] = ""
+        _refresh_ai_virtual_db_debug_state()
+    except Exception as exc:
+        summary["status"] = "error"
+        summary["reason"] = "exception"
+        summary["last_error"] = f"{exc.__class__.__name__}: {exc}"
+        st.session_state["ai_rule_auto_last_error"] = summary["last_error"]
+
+    st.session_state["ai_rule_auto_last_summary"] = summary
+    return summary
+
+
+def _render_rule_auto_log_status(summary: Dict[str, Any]) -> None:
+    st.caption(f"現在時刻JST：{summary.get('checked_at_jst', '-')}")
+    st.caption(f"市場ステータス：{summary.get('market_status', '-')}")
+    st.caption(f"自動保存：{'ON' if summary.get('auto_enabled') else 'OFF'}")
+    st.caption(f"実行間隔：{summary.get('interval_minutes', '-')}分")
+    st.caption(f"対象条件：{summary.get('target_mode', '-')}")
+    st.caption(f"最小スコア：{summary.get('min_score', '-')}")
+    st.caption(f"最大保存件数：{summary.get('max_count', '-')}")
+    st.caption(f"最終自動保存時刻：{summary.get('last_auto_save_at', '-')}")
+    st.caption(f"次回実行予定：{summary.get('next_run_hint', '-')}")
+
+    cols = st.columns(5)
+    cols[0].metric("対象候補数", summary.get("target_count", 0))
+    cols[1].metric("保存成功", summary.get("saved_count", 0))
+    cols[2].metric("保存失敗", summary.get("failed_count", 0))
+    cols[3].metric("duplicate", summary.get("duplicate_count", 0))
+    cols[4].metric("API calls", summary.get("openai_call_count", 0))
+
+    if summary.get("reason") == "signals_missing":
+        st.warning("まだ株価スキャン結果がありません。先に株価スキャンを実行してください")
+    elif summary.get("reason") == "market_closed":
+        st.info("市場時間外、昼休み、土日は自動保存を実行しません。")
+    elif summary.get("reason") == "interval_wait":
+        st.info("実行間隔の待機中です。")
+    elif summary.get("status") == "executed":
+        st.success("相場中ルール買いログ自動保存を実行しました。")
+
+    if summary.get("last_error"):
+        st.error(summary["last_error"])
+
+
+def _render_rule_auto_log_fragment() -> None:
+    interval_minutes = int(st.session_state.get("gpt_interval_minutes", 1) or 1)
+
+    @st.fragment(run_every=timedelta(minutes=interval_minutes))
+    def _fragment() -> None:
+        summary = _run_rule_auto_log_once()
+        _render_rule_auto_log_status(summary)
+        recent_results = st.session_state.get("ai_rule_auto_last_results", [])
+        if recent_results:
+            with st.expander("直近の相場中自動保存結果", expanded=False):
+                st.dataframe(_safe_dataframe(_virtual_result_table(recent_results)), width="stretch", hide_index=True)
+
+    _fragment()
+
+
+def _render_rule_auto_logger_section() -> None:
+    st.markdown("**相場中ルール買いログ自動保存**")
+    st.caption("画面を開いている間だけ、市場時間中にルールベースのpaper tradingログを保存します。実売買・発注は行いません。")
+    auto_enabled = st.toggle(
+        "相場中ルール買いログ自動保存",
+        value=False,
+        key="ai_virtual_logging_enabled",
+    )
+    st.session_state["auto_run_enabled"] = bool(auto_enabled)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.selectbox(
+            "実行間隔",
+            [1, 3, 5, 10],
+            index=0,
+            key="gpt_interval_minutes",
+            format_func=lambda value: f"{value}分",
+        )
+        target_label = st.selectbox(
+            "対象",
+            ["買い候補のみ", "買い候補＋監視"],
+            index=0,
+            key="ai_auto_target_label",
+        )
+        st.session_state["ai_auto_target_mode"] = "buy_watch" if "監視" in target_label else "buy_only"
+    with col_b:
+        st.selectbox("最小スコア", [70, 75, 80], index=0, key="ai_auto_min_score")
+        st.selectbox("最大保存件数", [1, 3, 5, 10], index=1, key="gpt_max_candidates")
+
+    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
+    st.caption("自動保存は安全運用のため常に rule_based_fallback で実行します。OpenAI APIは呼びません。")
+    _render_rule_auto_log_fragment()
+
+
 def _render_ai_virtual_trade_tab(
     buy: List[Dict[str, Any]],
     watch: List[Dict[str, Any]],
@@ -1564,8 +1771,6 @@ def _render_ai_virtual_trade_tab(
     st.caption(f"API呼び出し回数：{int(st.session_state.get('openai_call_count', 0))}")
     if not _openai_api_enabled():
         st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
-    st.caption(f"OpenAI API設定：{'あり' if api_configured else 'なし（ルールベースで仮想判断）'}")
-    st.caption(f"AI仮想取引モデル：{_current_ai_virtual_model()}")
     st.button(
         "OpenAI接続テスト",
         key="openai_connection_test_button",
@@ -1601,6 +1806,10 @@ def _render_ai_virtual_trade_tab(
     )
     _render_ai_virtual_db_test_result()
 
+    if not _openai_api_enabled():
+        st.caption("手動実行モード：rule_based_fallback（GPT判断なし）")
+    else:
+        st.caption("OpenAI API使用ONのため、手動実行ではGPT判定を使います。")
     st.button(
         "AI仮想判断を実行",
         key="run_ai_virtual_trade_callback_button",
@@ -1610,6 +1819,7 @@ def _render_ai_virtual_trade_tab(
         args=(candidates_snapshot,),
     )
 
+    _render_rule_auto_logger_section()
     _render_ai_virtual_callback_debug_state()
     _render_last_ai_virtual_run()
 

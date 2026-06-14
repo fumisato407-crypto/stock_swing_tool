@@ -102,6 +102,7 @@ def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = Fals
     duplicate = find_recent_virtual_trade(
         symbol=record["symbol"],
         entry_type=record["entry_type"],
+        judge_source=record["judge_source"],
         minutes=DUPLICATE_COOLDOWN_MINUTES,
     )
     if duplicate:
