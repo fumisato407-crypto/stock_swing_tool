@@ -52,7 +52,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-OpenAI APIキーは任意です。空のままでもルールベースのコメントで動きます。
+OpenAI APIキーは任意です。通常の株価スキャン、スコア計算、候補コメント生成ではOpenAI APIを呼びません。
 
 ## ローカル起動
 
@@ -400,6 +400,10 @@ OpenAI API:
 
 - ローカルでは`.env`、Streamlit CloudではSecretsに`OPENAI_API_KEY`を設定します。
 - AI仮想取引のモデルは`AI_VIRTUAL_MODEL`で指定できます。初期値は`gpt-5.5`です。
+- 通常の株価スキャン、スコア計算、候補コメント生成ではOpenAI APIを呼びません。
+- OpenAI APIを呼ぶのは、`OpenAI接続テスト`、または`AI仮想判断を実行`を押した時だけです。
+- 画面上の`openai_call_count`で、現在のセッション内のOpenAI API呼び出し回数を確認できます。
+- 初期表示直後は`openai_call_count=0`です。
 - APIキーがない、またはAPI呼び出しに失敗した場合は、アプリが落ちないようにルールベースの仮想判断へフォールバックします。
 - APIキーや秘密情報は画面、ログ、DBに表示しません。
 - OpenAI APIキーなしで保存した仮想判断は、`judge_source=fallback`、`model_used=rule_based_fallback`、`is_ai_generated=0`として記録されます。

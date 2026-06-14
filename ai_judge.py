@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any, Dict, List
 
-from config import AI_VIRTUAL_MODEL, OPENAI_API_KEY, OPENAI_MODEL, get_setting
+from config import AI_VIRTUAL_MODEL, get_setting
 
 
 def _rule_based_comment(signal: Dict[str, Any]) -> str:
@@ -86,41 +85,7 @@ def _rule_based_comment(signal: Dict[str, Any]) -> str:
     )
 
 
-def _openai_comment(signal: Dict[str, Any]) -> str:
-    from openai import OpenAI
-
-    client = OpenAI(api_key=OPENAI_API_KEY, timeout=8)
-    prompt = f"""
-日本株の1〜5日スイング候補について、投資助言ではなく分析補助の短いコメントを書いてください。
-焦って買う側か、投げ売りを拾う側か、高値掴みリスク、無効条件を自然に含めてください。
-
-銘柄: {signal.get("code")} {signal.get("name")}
-分類: {signal.get("category")}
-狙い: {signal.get("entry_type")}
-スコア: {signal.get("score")}
-スコア内訳: {signal.get("score_breakdown")}
-RSIなど: {signal.get("raw_metrics")}
-リスク: {signal.get("risk_notes")}
-監視理由: {signal.get("monitoring_reason")}
-待ち条件: {signal.get("wait_condition")}
-買い条件: {signal.get("buy_condition")}
-無効条件: {signal.get("invalid_conditions")}
-買ってはいけない条件: {signal.get("no_buy_conditions")}
-"""
-    response = client.responses.create(
-        model=os.getenv("OPENAI_MODEL", OPENAI_MODEL),
-        input=prompt.strip(),
-        max_output_tokens=220,
-    )
-    return response.output_text.strip()
-
-
 def generate_hyena_comment(signal: Dict[str, Any]) -> str:
-    if OPENAI_API_KEY:
-        try:
-            return _openai_comment(signal)
-        except Exception:
-            return _rule_based_comment(signal)
     return _rule_based_comment(signal)
 
 

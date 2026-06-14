@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import time
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo
@@ -245,6 +246,36 @@ def _score(signal: Dict[str, Any]) -> int:
         return int(signal.get("score", 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _run_stock_scan(watchlist: pd.DataFrame, period: str) -> List[Dict[str, Any]]:
+    scan_start = now_jst_display()
+    started = time.perf_counter()
+    signals = _scan_cached(_records_key(watchlist), period, st.session_state.get("refresh_token", 0))
+    elapsed = round(time.perf_counter() - started, 2)
+    failed_count = sum(1 for signal in signals if signal.get("category") == "取得失敗")
+    st.session_state["latest_signals"] = signals
+    st.session_state["scan_status"] = {
+        "scan_start_jst": scan_start,
+        "scan_end_jst": now_jst_display(),
+        "elapsed_seconds": elapsed,
+        "signals_count": len(signals),
+        "failed_count": failed_count,
+    }
+    return signals
+
+
+def _render_scan_status() -> None:
+    status = st.session_state.get("scan_status", {})
+    if not status:
+        st.info("初期表示では株価スキャンを実行しません。必要なときに「株価スキャンを実行」を押してください。")
+        return
+    cols = st.columns(5)
+    cols[0].metric("signals", status.get("signals_count", 0))
+    cols[1].metric("failed", status.get("failed_count", 0))
+    cols[2].metric("elapsed", f"{status.get('elapsed_seconds', '-')}秒")
+    cols[3].metric("scan_start_jst", status.get("scan_start_jst", "-"))
+    cols[4].metric("scan_end_jst", status.get("scan_end_jst", "-"))
 
 
 def _split_signals(signals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], ...]:
@@ -929,7 +960,7 @@ def _render_intraday_tab(
         include_watchlist = st.checkbox("watchlist.csv全銘柄を対象", value=True)
     with col_b:
         include_swing_focus = st.checkbox("買い候補・監視銘柄を対象に含める", value=True)
-        auto_refresh = st.toggle("自動監視ON/OFF", value=True)
+        auto_refresh = st.toggle("自動監視ON/OFF", value=False)
 
     refresh_seconds = st.selectbox("監視間隔", [60, 120, 300], index=0, format_func=lambda value: f"{value}秒")
     manual_codes_text = st.text_area("手動入力コード（任意、カンマ・空白・改行区切り）", placeholder="例: 5803, 3774, 6501")
@@ -1233,6 +1264,10 @@ def _current_ai_virtual_model() -> str:
     return get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)
 
 
+def _increment_openai_call_count(amount: int = 1) -> None:
+    st.session_state["openai_call_count"] = int(st.session_state.get("openai_call_count", 0)) + int(amount)
+
+
 def _on_openai_connection_test_click() -> None:
     tested_at = now_jst_display()
     api_key = get_setting("OPENAI_API_KEY", "")
@@ -1250,7 +1285,8 @@ def _on_openai_connection_test_click() -> None:
     try:
         from openai import OpenAI
 
-        client = OpenAI(api_key=api_key, timeout=20)
+        client = OpenAI(api_key=api_key, timeout=10)
+        _increment_openai_call_count()
         client.responses.create(
             model=model,
             input='JSONで {"ok": true} だけ返してください',
@@ -1275,8 +1311,10 @@ def _on_openai_connection_test_click() -> None:
 
 def _render_openai_connection_test_state() -> None:
     st.markdown("**OpenAI接続テスト**")
+    st.info("初期スキャンではOpenAI APIを呼びません。AI仮想判断ボタン、またはOpenAI接続テストを押した時だけ呼びます。")
     st.caption(f"OPENAI_API_KEY設定状態：{'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
     st.caption(f"AI_VIRTUAL_MODEL：{_current_ai_virtual_model()}")
+    st.caption(f"openai_call_count：{int(st.session_state.get('openai_call_count', 0))}")
     result = st.session_state.get("openai_test_result")
     if not result:
         st.info("まだOpenAI接続テストは実行していません。")
@@ -1376,6 +1414,8 @@ def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = 
     clicked_at = _mark_ai_virtual_callback_click("ai_virtual_run")
     candidates = list(candidates_snapshot or st.session_state.get("ai_virtual_candidates_snapshot", []))
     try:
+        if get_setting("OPENAI_API_KEY", "").strip():
+            _increment_openai_call_count(len(candidates))
         results = process_virtual_trade_signals(candidates)
         saved_count = sum(1 for result in results if result.get("saved"))
         failed_count = len(results) - saved_count
@@ -1662,6 +1702,10 @@ def _render_trades() -> None:
 def main() -> None:
     st.title("日本株 1〜5日スイング候補ツール")
     st.caption("自動売買ではありません。最終判断は必ずご自身で行ってください。")
+    if "openai_call_count" not in st.session_state:
+        st.session_state["openai_call_count"] = 0
+    if "latest_signals" not in st.session_state:
+        st.session_state["latest_signals"] = []
 
     with st.sidebar:
         st.header("設定")
@@ -1669,9 +1713,11 @@ def main() -> None:
         default_index = period_options.index(DEFAULT_PRICE_PERIOD) if DEFAULT_PRICE_PERIOD in period_options else 1
         period = st.selectbox("株価取得期間", period_options, index=default_index)
         st.caption(f"買い候補: {BUY_SCORE_THRESHOLD}点以上 / 監視: {WATCH_SCORE_THRESHOLD}点以上")
+        st.caption("初期スキャンではOpenAI APIを呼びません。")
+        st.caption(f"openai_call_count: {int(st.session_state.get('openai_call_count', 0))}")
         if "refresh_token" not in st.session_state:
             st.session_state.refresh_token = 0
-        if st.button("株価を再取得"):
+        if st.button("キャッシュをクリア"):
             st.session_state.refresh_token += 1
             st.cache_data.clear()
         st.divider()
@@ -1697,8 +1743,15 @@ def main() -> None:
     if watchlist_error:
         st.warning(watchlist_error)
 
-    with st.spinner("株価取得とスコア計算を実行中です..."):
-        signals = _scan_cached(_records_key(watchlist), period, st.session_state.refresh_token)
+    st.info("初期表示ではOpenAI APIも株価スキャンも実行しません。スキャンは下のボタンを押した時だけ実行します。")
+    scan_cols = st.columns([1, 3])
+    if scan_cols[0].button("株価スキャンを実行", key="run_stock_scan_button", type="primary"):
+        with st.spinner("株価取得とスコア計算を実行中です..."):
+            _run_stock_scan(watchlist, period)
+    scan_cols[1].caption(f"初期表示直後の openai_call_count は 0 です。現在: {int(st.session_state.get('openai_call_count', 0))}")
+    _render_scan_status()
+
+    signals = list(st.session_state.get("latest_signals", []))
 
     buy, watch, avoid, failed = _split_signals(signals)
 
