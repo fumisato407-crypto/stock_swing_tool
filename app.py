@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from alert_builder import alert_key, append_alert_log, build_buy_candidate_discord_text, send_discord_webhook
-from config import ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, VIRTUAL_TRADES_DB_PATH, get_setting
+from config import AI_VIRTUAL_MODEL, ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, VIRTUAL_TRADES_DB_PATH, get_setting
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from notifier import format_yen
@@ -1132,6 +1133,13 @@ def _render_virtual_trade_result(result: Dict[str, Any], idx: int) -> None:
             f"**model**：{record.get('model_used', '-')} / "
             f"**AI生成**：{record.get('is_ai_generated', '-')}"
         )
+        if record.get("fallback_reason") or record.get("fallback_error_type"):
+            st.markdown(
+                f"**fallback**：{record.get('fallback_reason', '-')} / "
+                f"{record.get('fallback_error_type', '-')}"
+            )
+            if record.get("fallback_error_message"):
+                st.caption(record.get("fallback_error_message"))
         st.markdown(f"**JST時刻**：{record.get('timestamp_jst', record.get('timestamp', '-'))}")
         st.markdown(f"**損切り**：{format_yen(decision.get('stop_loss'))}")
         st.markdown(f"**利確**：{format_yen(decision.get('take_profit'))}")
@@ -1161,6 +1169,9 @@ def _virtual_result_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
                 "judge_source": record.get("judge_source", decision.get("judge_source", "")),
                 "model_used": record.get("model_used", decision.get("model_used", "")),
                 "is_ai_generated": record.get("is_ai_generated", decision.get("is_ai_generated", "")),
+                "fallback_reason": record.get("fallback_reason", decision.get("fallback_reason", "")),
+                "fallback_error_type": record.get("fallback_error_type", decision.get("fallback_error_type", "")),
+                "fallback_error_message": record.get("fallback_error_message", decision.get("fallback_error_message", "")),
                 "source_score": record.get("source_score", ""),
             }
         )
@@ -1210,6 +1221,83 @@ def _render_last_ai_virtual_run() -> None:
         st.info("保存後に再取得した最近ログは空です。")
 
 
+def _mask_sensitive_openai_error(message: Any, *secrets: str) -> str:
+    masked = str(message or "")
+    for secret in secrets:
+        if secret:
+            masked = masked.replace(secret, "[masked]")
+    return re.sub(r"sk-[A-Za-z0-9_\-\*]{4,}", "[masked]", masked)
+
+
+def _current_ai_virtual_model() -> str:
+    return get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)
+
+
+def _on_openai_connection_test_click() -> None:
+    tested_at = now_jst_display()
+    api_key = get_setting("OPENAI_API_KEY", "")
+    model = _current_ai_virtual_model()
+    if not api_key.strip():
+        st.session_state["openai_test_result"] = {
+            "status": "missing_key",
+            "model_used": model,
+            "error_type": "",
+            "error_message": "OPENAI_API_KEYが未設定です。",
+            "tested_at_jst": tested_at,
+        }
+        return
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, timeout=20)
+        client.responses.create(
+            model=model,
+            input='JSONで {"ok": true} だけ返してください',
+            max_output_tokens=30,
+        )
+        st.session_state["openai_test_result"] = {
+            "status": "ok",
+            "model_used": model,
+            "error_type": "",
+            "error_message": "",
+            "tested_at_jst": tested_at,
+        }
+    except Exception as exc:
+        st.session_state["openai_test_result"] = {
+            "status": "error",
+            "model_used": model,
+            "error_type": exc.__class__.__name__,
+            "error_message": _mask_sensitive_openai_error(str(exc), api_key),
+            "tested_at_jst": tested_at,
+        }
+
+
+def _render_openai_connection_test_state() -> None:
+    st.markdown("**OpenAI接続テスト**")
+    st.caption(f"OPENAI_API_KEY設定状態：{'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
+    st.caption(f"AI_VIRTUAL_MODEL：{_current_ai_virtual_model()}")
+    result = st.session_state.get("openai_test_result")
+    if not result:
+        st.info("まだOpenAI接続テストは実行していません。")
+        return
+    if result.get("status") == "ok":
+        st.success("OpenAI接続テスト: ok")
+    elif result.get("status") == "missing_key":
+        st.warning("OpenAI接続テスト: missing_key")
+    else:
+        st.error("OpenAI接続テスト: error")
+    st.json(
+        {
+            "status": result.get("status", ""),
+            "model_used": result.get("model_used", ""),
+            "error_type": result.get("error_type", ""),
+            "error_message": result.get("error_message", ""),
+            "tested_at_jst": result.get("tested_at_jst", ""),
+        }
+    )
+
+
 def _insert_ai_virtual_db_test_record() -> int:
     now = now_jst_iso()
     return insert_virtual_trade(
@@ -1232,6 +1320,9 @@ def _insert_ai_virtual_db_test_record() -> int:
             "model_used": "db_test",
             "is_ai_generated": 0,
             "judge_source": "test",
+            "fallback_reason": "",
+            "fallback_error_type": "",
+            "fallback_error_message": "",
             "market_snapshot_json": {
                 "test": True,
                 "created_at": now,
@@ -1384,7 +1475,13 @@ def _render_ai_virtual_trade_tab(
 
     api_configured = bool(get_setting("OPENAI_API_KEY", "").strip())
     st.caption(f"OpenAI API設定：{'あり' if api_configured else 'なし（ルールベースで仮想判断）'}")
-    st.caption(f"AI仮想取引モデル：{get_setting('AI_VIRTUAL_MODEL', 'gpt-5.5')}")
+    st.caption(f"AI仮想取引モデル：{_current_ai_virtual_model()}")
+    st.button(
+        "OpenAI接続テスト",
+        key="openai_connection_test_button",
+        on_click=_on_openai_connection_test_click,
+    )
+    _render_openai_connection_test_state()
 
     trades = load_virtual_trades(limit=1000)
     metric_cols = st.columns(4)
@@ -1448,6 +1545,9 @@ def _render_ai_virtual_trade_tab(
                 "judge_source",
                 "model_used",
                 "is_ai_generated",
+                "fallback_reason",
+                "fallback_error_type",
+                "fallback_error_message",
                 "confidence",
                 "entry_price",
                 "stop_loss",
@@ -1488,6 +1588,9 @@ def _render_virtual_performance_tab() -> None:
             "judge_source",
             "model_used",
             "is_ai_generated",
+            "fallback_reason",
+            "fallback_error_type",
+            "fallback_error_message",
             "entry_price",
             "return_pct",
             "max_profit_pct",

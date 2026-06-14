@@ -44,6 +44,9 @@ VIRTUAL_TRADE_COLUMNS = [
     "timestamp_jst",
     "created_at_jst",
     "outcome_updated_at_jst",
+    "fallback_reason",
+    "fallback_error_type",
+    "fallback_error_message",
 ]
 
 
@@ -86,7 +89,10 @@ def ensure_virtual_trade_store(path: Path = VIRTUAL_TRADES_DB_PATH) -> None:
                 judge_source TEXT,
                 timestamp_jst TEXT,
                 created_at_jst TEXT,
-                outcome_updated_at_jst TEXT
+                outcome_updated_at_jst TEXT,
+                fallback_reason TEXT,
+                fallback_error_type TEXT,
+                fallback_error_message TEXT
             )
             """
         )
@@ -106,6 +112,9 @@ def ensure_virtual_trade_store(path: Path = VIRTUAL_TRADES_DB_PATH) -> None:
             "timestamp_jst": "TEXT",
             "created_at_jst": "TEXT",
             "outcome_updated_at_jst": "TEXT",
+            "fallback_reason": "TEXT",
+            "fallback_error_type": "TEXT",
+            "fallback_error_message": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing:
@@ -150,6 +159,9 @@ def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_
         "judge_source": str(record.get("judge_source", "unknown")),
         "timestamp_jst": timestamp_jst,
         "created_at_jst": created_at_jst,
+        "fallback_reason": str(record.get("fallback_reason", "")),
+        "fallback_error_type": str(record.get("fallback_error_type", "")),
+        "fallback_error_message": str(record.get("fallback_error_message", "")),
     }
     with closing(_connect(path)) as conn:
         cur = conn.execute(
@@ -158,12 +170,14 @@ def insert_virtual_trade(record: Dict[str, Any], path: Path = VIRTUAL_TRADES_DB_
                 timestamp, symbol, name, decision, entry_type, confidence,
                 entry_price, stop_loss, take_profit, max_hold_days,
                 reasons, risk_factors, source_score, market_snapshot_json, status,
-                model_used, is_ai_generated, judge_source, timestamp_jst, created_at_jst
+                model_used, is_ai_generated, judge_source, timestamp_jst, created_at_jst,
+                fallback_reason, fallback_error_type, fallback_error_message
             ) VALUES (
                 :timestamp, :symbol, :name, :decision, :entry_type, :confidence,
                 :entry_price, :stop_loss, :take_profit, :max_hold_days,
                 :reasons, :risk_factors, :source_score, :market_snapshot_json, :status,
-                :model_used, :is_ai_generated, :judge_source, :timestamp_jst, :created_at_jst
+                :model_used, :is_ai_generated, :judge_source, :timestamp_jst, :created_at_jst,
+                :fallback_reason, :fallback_error_type, :fallback_error_message
             )
             """,
             payload,
@@ -274,6 +288,9 @@ def rows_to_display(df: pd.DataFrame) -> pd.DataFrame:
         "judge_source",
         "model_used",
         "is_ai_generated",
+        "fallback_reason",
+        "fallback_error_type",
+        "fallback_error_message",
         "confidence",
         "entry_price",
         "stop_loss",

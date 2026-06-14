@@ -78,6 +78,9 @@ def build_virtual_trade_record(
         "model_used": model_used,
         "is_ai_generated": 1 if is_ai_generated else 0,
         "judge_source": judge_source,
+        "fallback_reason": decision.get("fallback_reason", ""),
+        "fallback_error_type": decision.get("fallback_error_type", ""),
+        "fallback_error_message": decision.get("fallback_error_message", ""),
     }
 
 

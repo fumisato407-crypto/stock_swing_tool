@@ -146,6 +146,15 @@ def _safe_list(value: Any) -> List[str]:
     return [str(value)]
 
 
+def _mask_sensitive_text(text: Any, *secrets: str) -> str:
+    masked = str(text or "")
+    for secret in secrets:
+        if secret:
+            masked = masked.replace(secret, "[masked]")
+    masked = re.sub(r"sk-[A-Za-z0-9_\-\*]{4,}", "[masked]", masked)
+    return masked
+
+
 def build_market_snapshot(signal: Dict[str, Any]) -> Dict[str, Any]:
     """Create a point-in-time snapshot for AI paper trading without future data."""
     return {
@@ -171,7 +180,12 @@ def build_market_snapshot(signal: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _fallback_virtual_decision(signal: Dict[str, Any]) -> Dict[str, Any]:
+def _fallback_virtual_decision(
+    signal: Dict[str, Any],
+    fallback_reason: str = "rule_based_fallback",
+    fallback_error_type: str = "",
+    fallback_error_message: str = "",
+) -> Dict[str, Any]:
     score = int(_num(signal.get("score", signal.get("intraday_score", 0))))
     price = _num(signal.get("price", signal.get("current_price", 0)))
     entry_type = str(signal.get("entry_type", signal.get("signal_type", "仮想押し目")) or "仮想押し目")
@@ -202,6 +216,9 @@ def _fallback_virtual_decision(signal: Dict[str, Any]) -> Dict[str, Any]:
         or ["出来高不足、地合い悪化、想定ライン割れ"],
         "model_used": "rule_based_fallback",
         "is_ai_generated": False,
+        "fallback_reason": fallback_reason,
+        "fallback_error_type": fallback_error_type,
+        "fallback_error_message": fallback_error_message,
     }
 
 
@@ -240,6 +257,9 @@ def _validate_virtual_decision(raw: Dict[str, Any], fallback: Dict[str, Any]) ->
         "risk_factors": _safe_list(raw.get("risk_factors")) or fallback["risk_factors"],
         "model_used": model_used,
         "is_ai_generated": is_ai_generated,
+        "fallback_reason": str(raw.get("fallback_reason", "")),
+        "fallback_error_type": str(raw.get("fallback_error_type", "")),
+        "fallback_error_message": str(raw.get("fallback_error_message", "")),
     }
 
 
@@ -248,7 +268,7 @@ def judge_virtual_trade(signal: Dict[str, Any]) -> Dict[str, Any]:
     fallback = _fallback_virtual_decision(signal)
     api_key = get_setting("OPENAI_API_KEY", "")
     if not api_key:
-        return fallback
+        return _fallback_virtual_decision(signal, fallback_reason="missing_openai_api_key")
 
     snapshot = build_market_snapshot(signal)
     prompt = f"""
@@ -280,5 +300,10 @@ max_hold_days, reasons, risk_factors
         parsed["model_used"] = get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)
         parsed["is_ai_generated"] = True
         return _validate_virtual_decision(parsed, fallback)
-    except Exception:
-        return fallback
+    except Exception as exc:
+        return _fallback_virtual_decision(
+            signal,
+            fallback_reason="openai_api_error",
+            fallback_error_type=exc.__class__.__name__,
+            fallback_error_message=_mask_sensitive_text(str(exc), api_key),
+        )
