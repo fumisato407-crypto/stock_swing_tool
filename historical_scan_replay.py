@@ -5,8 +5,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
+from daily_top_n_filter import build_buy_condition_json, daily_score_from_filter, rank_daily_candidates
 from data_fetcher import normalize_jp_symbol
 from historical_data import load_or_fetch_historical_data, validate_historical_ohlcv
+from multi_timeframe_rules import build_replay_daily_context, evaluate_daily_filter
 from replay_engine import (
     ReplayRuleConfig,
     apply_replay_money_metrics,
@@ -46,6 +48,9 @@ class HistoricalScanReplayConfig:
     max_stop_loss_pct: float = 3.0
     max_loss_yen_limit: float = 20000.0
     min_risk_reward: float = 1.2
+    use_daily_top_n: bool = False
+    daily_top_n: int = 10
+    min_daily_score: int = 70
 
 
 def _timestamp_text(value: Any) -> str:
@@ -246,6 +251,60 @@ def _symbol_trade_summary(
     return pd.DataFrame(rows)
 
 
+def _daily_top_n_settings(config: HistoricalScanReplayConfig) -> Dict[str, Any]:
+    return {
+        "use_daily_top_n": bool(config.use_daily_top_n),
+        "daily_top_n": int(config.daily_top_n),
+        "min_daily_score": int(config.min_daily_score),
+        "min_score": int(config.min_score),
+        "max_stop_loss_pct": config.max_stop_loss_pct,
+        "max_loss_yen_limit": config.max_loss_yen_limit,
+        "min_risk_reward": config.min_risk_reward,
+    }
+
+
+def _daily_rank_info_for_scan_time(
+    data_by_symbol: Dict[str, Dict[str, Any]],
+    scan_time: pd.Timestamp,
+    config: HistoricalScanReplayConfig,
+) -> Dict[str, Dict[str, Any]]:
+    daily_candidates: List[Dict[str, Any]] = []
+    mtf_config = {
+        "daily_min_ok": config.daily_min_ok if config.daily_filter_required else 0,
+        "intraday_min_ok": config.intraday_min_ok,
+        "use_vwap": config.use_vwap,
+        "use_volume_spike": config.use_volume_spike,
+    }
+    for symbol, item in data_by_symbol.items():
+        df: pd.DataFrame = item["data"]
+        if scan_time not in df.index:
+            continue
+        history = df.loc[df.index <= scan_time]
+        if history.empty:
+            continue
+        daily_context = build_replay_daily_context(history, scan_time, prior_daily_df=item.get("daily_data"))
+        daily_filter = evaluate_daily_filter(daily_context, current_time=None, config=mtf_config)
+        daily_score = int(daily_filter.get("daily_score", daily_score_from_filter(daily_filter)) or 0)
+        daily_candidates.append(
+            {
+                "symbol": symbol,
+                "daily_filter": daily_filter,
+                "daily_filter_json": daily_filter,
+                "daily_ok_count": daily_filter.get("daily_ok_count", 0),
+                "daily_total_count": daily_filter.get("daily_total_count", 4),
+                "daily_score": daily_score,
+            }
+        )
+
+    ranked = rank_daily_candidates(
+        daily_candidates,
+        top_n=config.daily_top_n,
+        min_daily_score=config.min_daily_score,
+        enabled=config.use_daily_top_n,
+    )
+    return {str(item["symbol"]): item for item in ranked}
+
+
 def run_historical_scan_replay(
     watchlist_records: List[Dict[str, Any]],
     config: HistoricalScanReplayConfig,
@@ -282,9 +341,14 @@ def run_historical_scan_replay(
         if progress_callback:
             progress_callback("スキャン再現中", step_index, max(1, total_scan_steps), _timestamp_text(scan_time))
         candidates: List[Dict[str, Any]] = []
+        daily_rank_info = _daily_rank_info_for_scan_time(data_by_symbol, scan_time, config)
+        top_n_pool_count = sum(1 for item in daily_rank_info.values() if item.get("daily_top_n_pass"))
         for symbol, item in data_by_symbol.items():
             df: pd.DataFrame = item["data"]
             if scan_time not in df.index:
+                continue
+            daily_meta = daily_rank_info.get(symbol, {})
+            if config.use_daily_top_n and not daily_meta.get("daily_top_n_pass"):
                 continue
             history = df.loc[df.index <= scan_time]
             if len(history) < 25:
@@ -299,6 +363,21 @@ def run_historical_scan_replay(
             )
             if signal.get("replay_skip_reason"):
                 continue
+            signal.update(
+                {
+                    key: value
+                    for key, value in daily_meta.items()
+                    if key
+                    in {
+                        "daily_score",
+                        "daily_rank_at_scan",
+                        "daily_rank_total",
+                        "daily_top_n_pass",
+                        "daily_top_n",
+                    }
+                }
+            )
+            signal["buy_condition_json"] = build_buy_condition_json(signal, _daily_top_n_settings(config))
             category = _category(signal)
             if not _target_allows(category, config.target_mode):
                 continue
@@ -313,7 +392,14 @@ def run_historical_scan_replay(
 
         total_candidates += len(candidates)
         selected = sorted(candidates, key=lambda signal: _score(signal), reverse=True)[: int(config.max_buys_per_scan)]
-        selected_by_scan_time.append({"scan_time": _timestamp_text(scan_time), "selected_count": len(selected)})
+        selected_by_scan_time.append(
+            {
+                "scan_time": _timestamp_text(scan_time),
+                "selected_count": len(selected),
+                "daily_top_n_pool_count": top_n_pool_count,
+                "daily_rank_total": len(daily_rank_info),
+            }
+        )
         for rank, signal in enumerate(selected, start=1):
             symbol = str(signal["symbol"])
             item = data_by_symbol[symbol]
@@ -386,6 +472,25 @@ def run_historical_scan_replay(
         "max_stop_loss_pct": config.max_stop_loss_pct,
         "max_loss_yen_limit": config.max_loss_yen_limit,
         "min_risk_reward": config.min_risk_reward,
+        "use_daily_top_n": config.use_daily_top_n,
+        "daily_top_n": config.daily_top_n,
+        "min_daily_score": config.min_daily_score,
+        "watchlist_limit": config.max_symbols,
+        "max_virtual_buys_per_scan": config.max_buys_per_scan,
+        "risk_filter_settings": {
+            "use_risk_filter": config.use_risk_filter,
+            "max_stop_loss_pct": config.max_stop_loss_pct,
+            "max_loss_yen_limit": config.max_loss_yen_limit,
+            "min_risk_reward": config.min_risk_reward,
+        },
+        "multi_timeframe_settings": {
+            "use_multi_timeframe": config.use_multi_timeframe,
+            "daily_filter_required": config.daily_filter_required,
+            "daily_min_ok": config.daily_min_ok,
+            "intraday_min_ok": config.intraday_min_ok,
+            "use_vwap": config.use_vwap,
+            "use_volume_spike": config.use_volume_spike,
+        },
         "total_scan_steps": total_scan_steps,
         "total_candidates": total_candidates,
         "total_trades": len(trades),

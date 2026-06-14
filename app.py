@@ -50,6 +50,7 @@ from virtual_trade_store import (
     load_virtual_trades,
     rows_to_display,
 )
+from watchlist_filter import filter_watchlist_symbols, parse_symbol_input
 
 st.set_page_config(
     page_title="日本株 1〜5日スイング候補ツール",
@@ -97,6 +98,8 @@ COMPACT_COLUMNS = [
     "name",
     "price",
     "score",
+    "daily_rank",
+    "daily_score",
     "daily_ok",
     "intraday_ok",
     "multi_timeframe",
@@ -170,6 +173,7 @@ HISTORICAL_SCAN_COOLDOWN_OPTIONS = {
     "3時間": "3h",
     "当日中": "day",
 }
+DAILY_TOP_N_OPTIONS = [5, 10, 15, 20, 30]
 DISCORD_BUY_SCORE_THRESHOLD = 70
 DISCORD_COOLDOWN_MINUTES = 30
 JST = ZoneInfo("Asia/Tokyo")
@@ -314,6 +318,7 @@ def _run_stock_scan(watchlist: pd.DataFrame, period: str) -> List[Dict[str, Any]
     signals = _scan_cached(_records_key(watchlist), period, st.session_state.get("refresh_token", 0))
     elapsed = round(time.perf_counter() - started, 2)
     failed_count = sum(1 for signal in signals if signal.get("category") == "取得失敗")
+    daily_top_n_pass_count = sum(1 for signal in signals if signal.get("daily_top_n_pass"))
     st.session_state["latest_signals"] = signals
     st.session_state["scan_status"] = {
         "scan_start_jst": scan_start,
@@ -321,6 +326,7 @@ def _run_stock_scan(watchlist: pd.DataFrame, period: str) -> List[Dict[str, Any]
         "elapsed_seconds": elapsed,
         "signals_count": len(signals),
         "failed_count": failed_count,
+        "daily_top_n_pass_count": daily_top_n_pass_count,
     }
     return signals
 
@@ -330,12 +336,13 @@ def _render_scan_status() -> None:
     if not status:
         st.info("初期表示では株価スキャンを実行しません。必要なときに「株価スキャンを実行」を押してください。")
         return
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("signals", status.get("signals_count", 0))
     cols[1].metric("failed", status.get("failed_count", 0))
-    cols[2].metric("elapsed", f"{status.get('elapsed_seconds', '-')}秒")
-    cols[3].metric("scan_start_jst", status.get("scan_start_jst", "-"))
-    cols[4].metric("scan_end_jst", status.get("scan_end_jst", "-"))
+    cols[2].metric("日足上位N通過", status.get("daily_top_n_pass_count", 0))
+    cols[3].metric("elapsed", f"{status.get('elapsed_seconds', '-')}秒")
+    cols[4].metric("scan_start_jst", status.get("scan_start_jst", "-"))
+    cols[5].metric("scan_end_jst", status.get("scan_end_jst", "-"))
 
 
 def _split_signals(signals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], ...]:
@@ -468,6 +475,12 @@ def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
                 "name": signal.get("name", ""),
                 "price": format_yen(signal.get("price")),
                 "score": signal.get("score", "-"),
+                "daily_rank": (
+                    f"{signal.get('daily_rank_at_scan')}位/{signal.get('daily_rank_total')}銘柄"
+                    if signal.get("daily_rank_at_scan") not in (None, "")
+                    else "-"
+                ),
+                "daily_score": _format_score_value(signal.get("daily_score")),
                 "daily_ok": f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
                 "intraday_ok": f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
                 "multi_timeframe": "OK" if signal.get("multi_timeframe_pass") else "NG",
@@ -751,10 +764,10 @@ def _intraday_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool
     )
     if not has_intraday:
         rows = [
-            {"条件": "VWAP上", "判定": "未使用", "補足": "通常株価スキャンでは5分足を取得しません"},
-            {"条件": "直近高値突破", "判定": "未取得", "補足": "場中監視タブで確認"},
-            {"条件": "押し目反発", "判定": "未取得", "補足": "場中監視タブで確認"},
-            {"条件": "出来高急増", "判定": "未取得", "補足": "場中監視タブで確認"},
+            {"条件": "VWAP上", "判定": "未取得", "補足": "日足上位N対象外、または5分足未取得"},
+            {"条件": "直近高値突破", "判定": "未取得", "補足": "日足上位N通過後に5分足で確認"},
+            {"条件": "押し目反発", "判定": "未取得", "補足": "日足上位N通過後に5分足で確認"},
+            {"条件": "出来高急増", "判定": "未取得", "補足": "日足上位N通過後に5分足で確認"},
         ]
         return _condition_table(rows), None
 
@@ -823,7 +836,7 @@ def _combined_judgement_text(daily_ok: bool | None, intraday_ok: bool | None) ->
     if daily_ok is None:
         return "場中エントリー監視は5分足判定です。日足フィルターは通常株価スキャンとは別判定です。"
     if intraday_ok is None:
-        return "通常株価スキャンは日足のみです。5分足エントリーは場中エントリー監視タブで別確認です。"
+        return "日足上位N対象外、または5分足データ未取得のため、5分足エントリーは未判定です。"
     if daily_ok and intraday_ok:
         return "日足OK + 5分足OK = マルチ時間足買い候補"
     if daily_ok and not intraday_ok:
@@ -836,7 +849,7 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     daily_df, daily_ok = _daily_condition_rows(signal)
     intraday_df, intraday_ok = _intraday_condition_rows(signal)
     risk_df, risk_ok = _risk_condition_rows(signal)
-    metric_cols = st.columns(3)
+    metric_cols = st.columns(5)
     metric_cols[0].metric(
         "日足",
         f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
@@ -845,7 +858,9 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
         "5分足",
         f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
     )
-    metric_cols[2].metric("統合判定", signal.get("category") or signal.get("judgement", "-"))
+    metric_cols[2].metric("日足順位", f"{signal.get('daily_rank_at_scan', '-')}/{signal.get('daily_rank_total', '-')}")
+    metric_cols[3].metric("日足スコア", _format_score_value(signal.get("daily_score")))
+    metric_cols[4].metric("統合判定", signal.get("category") or signal.get("judgement", "-"))
     cols = st.columns(3)
     with cols[0]:
         st.caption("日足フィルター")
@@ -870,6 +885,7 @@ def _render_logic_confirmation_section() -> None:
             _condition_table(
                 [
                     {"条件": "使用データ", "判定": "日足 + 5分足", "補足": "日足でフィルターし、取得できる場合は当日5分足でエントリー判定"},
+                    {"条件": "日足上位N", "判定": "使用", "補足": "日足スコア上位10銘柄、最低70点を5分足判定の母集団にします"},
                     {"条件": "25日線", "判定": "使用", "補足": "終値 > 25日線"},
                     {"条件": "前日終値", "判定": "使用", "補足": "現在の日足終値 > 前日終値"},
                     {"条件": "直近5日高値", "判定": "使用", "補足": "直近5日高値から2%以内"},
@@ -909,7 +925,7 @@ def _render_logic_confirmation_section() -> None:
                     {"条件": "使用データ", "判定": "日足 + 選択時間足", "補足": "マルチ時間足ON時は6か月日足と選択足を組み合わせます"},
                     {"条件": "買い判定", "判定": "未来データ未使用", "補足": "前日までの確定日足 + scan_time以前の足だけで評価"},
                     {"条件": "結果検証", "判定": "未来データ使用", "補足": "entry後のfuture_dfだけで利確/損切り/期限到達を検証"},
-                    {"条件": "日足+5分足統合", "判定": "使用可能", "補足": "初期値は日足3/4以上 + 5分足2/4以上"},
+                    {"条件": "日足+5分足統合", "判定": "使用可能", "補足": "初期値は日足3/4以上 + 日足上位N + 5分足2/4以上"},
                     {"条件": "OpenAI API", "判定": "未使用", "補足": "過去検証はルールベースのみです"},
                 ]
             ),
@@ -943,8 +959,9 @@ def _render_reason_list(title: str, values: Any) -> None:
 
 def _render_detail_content(signal: Dict[str, Any], key_prefix: str, show_chart: bool = False) -> None:
     _render_signal_metrics(signal)
+    buy_condition_text = _buy_condition_text(signal)
     st.markdown(f"<div class='signal-line'><b>狙い</b>：{signal.get('entry_type', '-')}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='signal-line'><b>買い条件</b>：{signal.get('entry_trigger', signal.get('buy_condition', '-'))}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='signal-line'><b>買い条件</b>：{buy_condition_text}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='signal-line'><b>待ち条件</b>：{signal.get('wait_condition', '-')}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='signal-line'><b>損切り</b>：{format_yen(signal.get('stop_loss'))}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='signal-line'><b>利確目安</b>：{_format_targets(signal)}</div>", unsafe_allow_html=True)
@@ -2679,6 +2696,12 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "損切り": format_yen(trade.get("stop_loss")),
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("scan_score", trade.get("score"))),
+                "日足順位": (
+                    f"{trade.get('daily_rank_at_scan')}位/{trade.get('daily_rank_total')}銘柄"
+                    if trade.get("daily_rank_at_scan") not in (None, "")
+                    else "-"
+                ),
+                "日足スコア": _format_score_value(trade.get("daily_score")),
                 "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
                 "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
                 "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
@@ -2687,6 +2710,7 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "想定利益": _format_signed_yen(trade.get("expected_profit_yen")),
                 "損益比": _format_profit_loss_ratio(trade.get("risk_reward_ratio")),
                 "リスク判定": _display_risk_pass(trade.get("risk_pass")),
+                "買い条件": _buy_condition_text(trade),
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -2708,6 +2732,8 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "損切り",
         "利確目標",
         "スコア",
+        "日足順位",
+        "日足スコア",
         "日足OK",
         "5分足OK",
         "マルチ通過",
@@ -2716,6 +2742,7 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "想定利益",
         "損益比",
         "リスク判定",
+        "買い条件",
         "結果",
         "終了時刻",
         "終了価格",
@@ -2816,6 +2843,57 @@ def _render_multi_timeframe_performance(trades: List[Dict[str, Any]], shares: in
         st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "intraday_ok_group", "5分足OK", shares)), width="stretch", hide_index=True)
         st.caption("マルチ時間足通過別")
         st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "multi_pass_group", "マルチ判定", shares)), width="stretch", hide_index=True)
+
+
+def _daily_rank_bucket(value: Any) -> str:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return "未計算"
+    if number <= 5:
+        return "1〜5位"
+    if number <= 10:
+        return "6〜10位"
+    if number <= 20:
+        return "11〜20位"
+    return "21位以下"
+
+
+def _daily_score_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未計算"
+    if number < 70:
+        return "70未満"
+    if number < 75:
+        return "70〜74"
+    if number < 80:
+        return "75〜79"
+    return "80以上"
+
+
+def _render_daily_top_n_performance(trades: List[Dict[str, Any]], shares: int) -> None:
+    if not trades:
+        return
+    prepared = []
+    for trade in trades:
+        row = dict(trade)
+        row["daily_rank_bucket"] = _daily_rank_bucket(row.get("daily_rank_at_scan"))
+        row["daily_score_bucket"] = _daily_score_bucket(row.get("daily_score"))
+        row["daily_top_n_group"] = "通過" if row.get("daily_top_n_pass") else "未通過"
+        prepared.append(row)
+
+    st.markdown("**日足上位N別 成績**")
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("日足順位別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "daily_rank_bucket", "日足順位", shares)), width="stretch", hide_index=True)
+        st.caption("日足スコア帯別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "daily_score_bucket", "日足スコア", shares)), width="stretch", hide_index=True)
+    with cols[1]:
+        st.caption("日足上位N通過別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "daily_top_n_group", "日足上位N", shares)), width="stretch", hide_index=True)
 
 
 def _stop_loss_bucket(value: Any) -> str:
@@ -2976,6 +3054,35 @@ def _risk_reason_text(trade: Dict[str, Any]) -> str:
     if isinstance(risk_filter, dict) and risk_filter.get("risk_reasons"):
         return "、".join(str(item) for item in risk_filter.get("risk_reasons", []))
     return "-"
+
+
+def _buy_condition_text(item: Dict[str, Any]) -> str:
+    condition = item.get("buy_condition_json")
+    if not isinstance(condition, dict):
+        condition = {}
+    daily_rank = item.get("daily_rank_at_scan", condition.get("daily_rank_at_scan"))
+    daily_total = item.get("daily_rank_total", condition.get("daily_rank_total"))
+    daily_score = item.get("daily_score", condition.get("daily_score"))
+    daily_ok = item.get("daily_ok_count", condition.get("daily_ok_count", "-"))
+    daily_total_count = item.get("daily_total_count", condition.get("daily_total_count", "-"))
+    intraday_ok = item.get("intraday_ok_count", condition.get("intraday_ok_count", "-"))
+    intraday_total_count = item.get("intraday_total_count", condition.get("intraday_total_count", "-"))
+    risk_pass = item.get("risk_pass", condition.get("risk_pass"))
+    top_n = item.get("daily_top_n", condition.get("daily_top_n"))
+    min_score = condition.get("min_score")
+    parts = []
+    if daily_rank not in (None, ""):
+        parts.append(f"日足順位 {daily_rank}位/{daily_total or '-'}銘柄中")
+    if daily_score not in (None, ""):
+        parts.append(f"日足スコア {_format_score_value(daily_score)}点")
+    parts.append(f"日足条件 {daily_ok}/{daily_total_count} OK")
+    parts.append(f"5分足条件 {intraday_ok}/{intraday_total_count} OK")
+    parts.append(f"リスク条件 {_display_risk_pass(risk_pass)}")
+    if min_score not in (None, ""):
+        parts.append(f"最小スコア {min_score}以上")
+    if top_n not in (None, ""):
+        parts.append(f"日足上位N {top_n}以内")
+    return " / ".join(parts)
 
 
 def _render_replay_money_summary(money_summary: Dict[str, Any]) -> None:
@@ -3171,6 +3278,12 @@ def _render_historical_scan_overall_summary(result: Dict[str, Any]) -> None:
     cols[4].metric("仮想買い", summary.get("total_trades", 0))
     cols[5].metric("勝率", _format_pct_value(summary.get("win_rate_pct")))
 
+    cols = st.columns(4)
+    cols[0].metric("日足上位N", "ON" if summary.get("use_daily_top_n") else "OFF")
+    cols[1].metric("上位N", summary.get("daily_top_n", "-"))
+    cols[2].metric("日足最低点", summary.get("min_daily_score", "-"))
+    cols[3].metric("watchlist上限", summary.get("watchlist_limit", "-"))
+
     _render_replay_money_summary(result.get("money_summary", {}))
 
 
@@ -3215,6 +3328,22 @@ def _render_historical_scan_rankings(symbol_summary: pd.DataFrame) -> None:
         )
 
 
+def _render_watchlist_filter_status(filter_result: Dict[str, Any], target_record_count: int) -> None:
+    st.markdown("**対象銘柄フィルター**")
+    cols = st.columns(4)
+    cols[0].metric("元watchlist", f"{filter_result.get('original_count', 0)}銘柄")
+    cols[1].metric("対象指定後", f"{filter_result.get('included_count', 0)}銘柄")
+    cols[2].metric("除外後", f"{filter_result.get('final_count', 0)}銘柄")
+    cols[3].metric("実行対象", f"{target_record_count}銘柄")
+
+    excluded_labels = filter_result.get("excluded_labels", [])
+    missing_symbols = filter_result.get("missing_symbols", [])
+    if excluded_labels:
+        st.caption("除外: " + ", ".join(str(item) for item in excluded_labels))
+    if missing_symbols:
+        st.warning("watchlistに存在しない入力銘柄: " + ", ".join(str(item) for item in missing_symbols))
+
+
 def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     st.markdown("**watchlist過去スキャン再現**")
     st.caption("market_runner.pyの過去版です。watchlist全体を過去の各時刻でスキャンし、当時の買い候補を仮想買いとして検証します。")
@@ -3223,7 +3352,13 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         return
 
     option_cols = st.columns(4)
-    max_symbols_label = option_cols[0].selectbox("最大対象銘柄数", list(HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS.keys()), index=1, key="historical_scan_max_symbols")
+    max_symbols_label = option_cols[0].selectbox(
+        "watchlistから使う最大銘柄数",
+        list(HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS.keys()),
+        index=1,
+        key="historical_scan_max_symbols",
+        help="watchlistから読み込む銘柄数の上限です。日足スコア上位Nとは別です。",
+    )
     period_label = option_cols[1].selectbox("期間", list(REPLAY_PERIOD_OPTIONS.keys()), index=0, key="historical_scan_period")
     interval_label = option_cols[2].selectbox("時間足", list(REPLAY_INTERVAL_OPTIONS.keys()), index=0, key="historical_scan_interval")
     scan_interval_label = option_cols[3].selectbox("スキャン間隔", list(HISTORICAL_SCAN_INTERVAL_OPTIONS.keys()), index=0, key="historical_scan_scan_interval")
@@ -3256,6 +3391,13 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     use_vwap = "VWAP" in mtf_options
     use_volume_spike = "出来高急増" in mtf_options
 
+    topn_cols = st.columns(4)
+    use_daily_top_n = topn_cols[0].toggle("日足スコア上位N銘柄に絞る", value=True, key="historical_scan_use_daily_top_n")
+    daily_top_n = int(topn_cols[1].selectbox("日足スコア上位N", DAILY_TOP_N_OPTIONS, index=1, key="historical_scan_daily_top_n"))
+    min_daily_score = int(topn_cols[2].number_input("日足スコアの最低点", min_value=0, max_value=100, value=70, step=1, key="historical_scan_min_daily_score"))
+    topn_cols[3].metric("上位抽出後の銘柄数", f"最大{daily_top_n}銘柄/回" if use_daily_top_n else "制限なし")
+    st.caption("処理順: watchlist読み込み → 対象/除外フィルター → watchlist上限 → 各時刻の日足スコア上位N → 5分足エントリー → リスク条件 → 最大仮想買い件数")
+
     risk_cols = st.columns(4)
     use_risk_filter = risk_cols[0].toggle("リスク条件を使う", value=True, key="historical_scan_use_risk_filter")
     max_stop_loss_pct = float(
@@ -3268,16 +3410,45 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         risk_cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="historical_scan_min_risk_reward")
     )
 
+    filter_cols = st.columns(2)
+    include_symbols_text = filter_cols[0].text_area(
+        "対象銘柄のみ",
+        value="",
+        placeholder="例: 6501.T,6723.T,6752.T\n空欄ならwatchlist全体",
+        height=84,
+        key="historical_scan_include_symbols_text",
+    )
+    exclude_symbols_text = filter_cols[1].text_area(
+        "除外銘柄",
+        value="",
+        placeholder="例: 6501.T,7751.T,7735.T\n空欄なら除外なし",
+        height=84,
+        key="historical_scan_exclude_symbols_text",
+    )
+    include_symbols = parse_symbol_input(include_symbols_text)
+    exclude_symbols = parse_symbol_input(exclude_symbols_text)
+    filter_result = filter_watchlist_symbols(watchlist, include_symbols=include_symbols, exclude_symbols=exclude_symbols)
+    filtered_watchlist = filter_result.get("filtered_watchlist", pd.DataFrame())
     max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
-    target_records = watchlist.to_dict("records")[: max_symbols or len(watchlist)]
-    if (max_symbols is None or int(max_symbols) > 30) and REPLAY_INTERVAL_OPTIONS[interval_label] == "5m":
+    if max_symbols is None:
+        limited_watchlist = filtered_watchlist
+    else:
+        limited_watchlist = filtered_watchlist.head(int(max_symbols))
+    target_records = limited_watchlist.to_dict("records")
+    _render_watchlist_filter_status(filter_result, len(target_records))
+    if int(filter_result.get("final_count", 0)) <= 0:
+        st.error("対象銘柄が0件です。対象銘柄のみ/除外銘柄の入力を確認してください。")
+    elif len(target_records) < int(filter_result.get("final_count", 0)):
+        st.caption(f"最大対象銘柄数により、除外後{filter_result.get('final_count', 0)}銘柄のうち{len(target_records)}銘柄を検証します。")
+    if len(target_records) > 30 and REPLAY_INTERVAL_OPTIONS[interval_label] == "5m":
         st.warning("5分足で30銘柄超は時間がかかります。まずは10〜30銘柄での確認を推奨します。")
 
     start_at = _combine_date_time(start_date, start_time)
     end_at = _combine_date_time(end_date, end_time)
-    run_disabled = start_at >= end_at
+    run_disabled = start_at >= end_at or not target_records
     if run_disabled:
-        st.warning("開始日時は終了日時より前にしてください。")
+        if start_at >= end_at:
+            st.warning("開始日時は終了日時より前にしてください。")
 
     if st.button("過去スキャン再現を実行", key="run_historical_scan_replay_button", type="primary", disabled=run_disabled):
         progress_bar = st.progress(0)
@@ -3312,8 +3483,30 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 max_stop_loss_pct=max_stop_loss_pct,
                 max_loss_yen_limit=max_loss_yen_limit,
                 min_risk_reward=min_risk_reward,
+                use_daily_top_n=bool(use_daily_top_n),
+                daily_top_n=int(daily_top_n),
+                min_daily_score=int(min_daily_score),
             )
             result = run_historical_scan_replay(target_records, config, progress_callback=_progress)
+            watchlist_filter_summary = {
+                "include_symbols_text": include_symbols_text,
+                "exclude_symbols_text": exclude_symbols_text,
+                "include_symbols": include_symbols,
+                "exclude_symbols": exclude_symbols,
+                "excluded_symbols": filter_result.get("excluded_symbols", []),
+                "excluded_labels": filter_result.get("excluded_labels", []),
+                "missing_symbols": filter_result.get("missing_symbols", []),
+                "original_count": filter_result.get("original_count", 0),
+                "included_count": filter_result.get("included_count", 0),
+                "final_symbols_count": filter_result.get("final_count", 0),
+                "target_records_count": len(target_records),
+            }
+            result["summary"]["watchlist_filter"] = watchlist_filter_summary
+            result["summary"]["include_symbols_text"] = include_symbols_text
+            result["summary"]["exclude_symbols_text"] = exclude_symbols_text
+            result["summary"]["final_symbols_count"] = filter_result.get("final_count", 0)
+            result["summary"]["target_records_count"] = len(target_records)
+            result["summary"]["missing_symbols"] = filter_result.get("missing_symbols", [])
             store_result = insert_replay_trades(
                 result["trades"],
                 replay_run_id=result["summary"].get("replay_run_id"),
@@ -3356,6 +3549,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         hide_index=True,
     )
     _render_multi_timeframe_performance(trades, int(result["summary"].get("shares", shares)))
+    _render_daily_top_n_performance(trades, int(result["summary"].get("shares", shares)))
     _render_risk_performance(trades, int(result["summary"].get("shares", shares)))
 
     _render_historical_scan_rankings(symbol_summary)

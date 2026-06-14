@@ -218,6 +218,11 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "rule_name": "intraday_replay_rule",
         "daily_ok_count": signal.get("daily_ok_count"),
         "daily_total_count": signal.get("daily_total_count"),
+        "daily_score": signal.get("daily_score"),
+        "daily_rank_at_scan": signal.get("daily_rank_at_scan"),
+        "daily_rank_total": signal.get("daily_rank_total"),
+        "daily_top_n_pass": signal.get("daily_top_n_pass"),
+        "daily_top_n": signal.get("daily_top_n"),
         "intraday_ok_count": signal.get("intraday_ok_count"),
         "intraday_total_count": signal.get("intraday_total_count"),
         "daily_filter_json": signal.get("daily_filter_json", signal.get("daily_filter", {})),
@@ -230,6 +235,7 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "risk_reward_ratio": signal.get("risk_reward_ratio"),
         "risk_filter_json": signal.get("risk_filter_json", signal.get("risk_filter", {})),
         "risk_reasons": signal.get("risk_reasons", []),
+        "buy_condition_json": signal.get("buy_condition_json", {}),
         "signal": {
             key: value
             for key, value in signal.items()

@@ -8,14 +8,17 @@ import pandas as pd
 
 from ai_judge import generate_hyena_comment
 from config import TRADES_PATH, WATCHLIST_PATH
+from daily_top_n_filter import build_buy_condition_json, daily_score_from_filter, rank_daily_candidates
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from indicators import add_indicators
 from intraday_scanner import fetch_intraday_data
-from multi_timeframe_rules import evaluate_multi_timeframe_signal, evaluate_risk_filter
+from multi_timeframe_rules import evaluate_daily_filter, evaluate_multi_timeframe_signal, evaluate_risk_filter
 from notifier import build_notification_text
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD, score_stock
 
 
+DEFAULT_DAILY_TOP_N = 10
+DEFAULT_MIN_DAILY_SCORE = 70
 WATCHLIST_COLUMNS = ["code", "name", "theme", "market", "raw_code", "normalized_symbol"]
 CODE_COLUMN_CANDIDATES = ["code", "ticker", "銘柄コード", "コード"]
 OPTIONAL_COLUMN_ALIASES = {
@@ -128,6 +131,7 @@ def _apply_multi_timeframe_result(
             "intraday_entry": intraday_entry,
             "daily_ok_count": daily_filter.get("daily_ok_count", 0),
             "daily_total_count": daily_filter.get("daily_total_count", 4),
+            "daily_score": daily_filter.get("daily_score", daily_score_from_filter(daily_filter)),
             "intraday_ok_count": intraday_entry.get("intraday_ok_count", 0),
             "intraday_total_count": intraday_entry.get("intraday_total_count", 4),
             "daily_filter_json": daily_filter,
@@ -145,6 +149,21 @@ def _apply_multi_timeframe_result(
             "risk_reward_ratio": risk_filter.get("risk_reward_ratio"),
             "risk_reasons": risk_filter.get("risk_reasons", []),
         }
+    )
+    for key in ("daily_rank_at_scan", "daily_rank_total", "daily_top_n_pass", "daily_top_n"):
+        if key in signal:
+            updated[key] = signal.get(key)
+    updated["buy_condition_json"] = build_buy_condition_json(
+        updated,
+        {
+            "use_daily_top_n": True,
+            "daily_top_n": updated.get("daily_top_n", DEFAULT_DAILY_TOP_N),
+            "min_daily_score": DEFAULT_MIN_DAILY_SCORE,
+            "min_score": BUY_SCORE_THRESHOLD,
+            "max_stop_loss_pct": risk_filter.get("max_stop_loss_pct"),
+            "max_loss_yen_limit": risk_filter.get("max_loss_yen_limit"),
+            "min_risk_reward": risk_filter.get("min_risk_reward"),
+        },
     )
     updated["score_breakdown"] = dict(updated.get("score_breakdown") or {})
     updated["score_breakdown"]["total_score"] = score
@@ -206,8 +225,15 @@ def load_watchlist(path: Path = WATCHLIST_PATH) -> pd.DataFrame:
     return result
 
 
-def scan_watchlist(records: Iterable[Dict[str, Any]], period: str = "6mo") -> List[Dict[str, Any]]:
+def scan_watchlist(
+    records: Iterable[Dict[str, Any]],
+    period: str = "6mo",
+    use_daily_top_n: bool = True,
+    daily_top_n: int = DEFAULT_DAILY_TOP_N,
+    min_daily_score: int = DEFAULT_MIN_DAILY_SCORE,
+) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
+    daily_signals: List[Dict[str, Any]] = []
     for record in records:
         raw_code = record.get("raw_code") or record.get("code", "")
         normalized_symbol = normalize_jp_symbol(record.get("normalized_symbol") or raw_code)
@@ -275,22 +301,67 @@ def scan_watchlist(records: Iterable[Dict[str, Any]], period: str = "6mo") -> Li
         scoring_record["code"] = code
         scoring_record["normalized_symbol"] = fetched.ticker
         signal = score_stock(analyzed, scoring_record)
+        daily_filter = evaluate_daily_filter(analyzed)
+        signal.update(
+            {
+                "daily_filter": daily_filter,
+                "daily_filter_json": daily_filter,
+                "daily_ok_count": daily_filter.get("daily_ok_count", 0),
+                "daily_total_count": daily_filter.get("daily_total_count", 4),
+                "daily_score": daily_filter.get("daily_score", daily_score_from_filter(daily_filter)),
+                "history": analyzed.tail(160),
+                "normalized_symbol": fetched.ticker,
+                "error_type": "",
+                "error_message": "",
+                "fetched_rows": fetched.fetched_rows,
+                "last_attempt_at": fetched.last_attempt_at,
+            }
+        )
+        daily_signals.append(signal)
+
+    ranked_daily_signals = rank_daily_candidates(
+        daily_signals,
+        top_n=daily_top_n,
+        min_daily_score=min_daily_score,
+        enabled=use_daily_top_n,
+    )
+
+    for signal in ranked_daily_signals:
+        code = str(signal.get("code") or "").replace(".T", "")
+        if use_daily_top_n and not signal.get("daily_top_n_pass"):
+            signal["category"] = "触らない"
+            signal["score"] = min(WATCH_SCORE_THRESHOLD - 1, int(signal.get("score", 0) or 0))
+            signal["entry_type"] = "日足上位N対象外"
+            signal["wait_condition"] = "日足スコア上位N入り待ち"
+            signal["monitoring_reason"] = (
+                f"日足順位 {signal.get('daily_rank_at_scan', '-')}位 / "
+                f"{signal.get('daily_rank_total', '-')}銘柄中、"
+                f"日足スコア {signal.get('daily_score', 0)}点"
+            )
+            signal["buy_condition_json"] = build_buy_condition_json(
+                signal,
+                {
+                    "use_daily_top_n": use_daily_top_n,
+                    "daily_top_n": daily_top_n,
+                    "min_daily_score": min_daily_score,
+                    "min_score": BUY_SCORE_THRESHOLD,
+                },
+            )
+            signal["comment"] = generate_hyena_comment(signal)
+            signal["notification_text"] = build_notification_text(signal)
+            signals.append(signal)
+            continue
+
         intraday = fetch_intraday_data(code, interval="5m", period="5d")
         signal = _apply_multi_timeframe_result(
             signal,
-            analyzed,
+            signal.get("history") if isinstance(signal.get("history"), pd.DataFrame) else pd.DataFrame(),
             intraday.data if not intraday.error else pd.DataFrame(),
             intraday_error_type=intraday.error_type,
             intraday_error_message=intraday.error_message,
         )
         signal["comment"] = generate_hyena_comment(signal)
         signal["notification_text"] = build_notification_text(signal)
-        signal["history"] = analyzed.tail(160)
-        signal["normalized_symbol"] = fetched.ticker
-        signal["error_type"] = ""
-        signal["error_message"] = ""
-        signal["fetched_rows"] = fetched.fetched_rows
-        signal["last_attempt_at"] = fetched.last_attempt_at
         signals.append(signal)
 
     return sorted(signals, key=lambda item: item.get("score", -1), reverse=True)

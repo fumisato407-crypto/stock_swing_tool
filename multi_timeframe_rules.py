@@ -132,6 +132,7 @@ def evaluate_daily_filter(
             "daily_volume_increase_ok": False,
             "daily_ok_count": 0,
             "daily_total_count": 4,
+            "daily_score": 0,
             "daily_pass": False,
             "reason": "日足25本未満のため判定不可",
         }
@@ -149,6 +150,7 @@ def evaluate_daily_filter(
     daily_volume_increase_ok = bool(avg_volume_5d and current_volume >= avg_volume_5d * cfg.daily_volume_multiplier)
     flags = [ma25_ok, above_prev_close_ok, near_5day_high_ok, daily_volume_increase_ok]
     ok_count = int(sum(flags))
+    daily_score = int(round(ok_count / 4 * 100))
     reasons = []
     if ma25_ok:
         reasons.append("25日線より上")
@@ -166,6 +168,7 @@ def evaluate_daily_filter(
         "daily_volume_increase_ok": daily_volume_increase_ok,
         "daily_ok_count": ok_count,
         "daily_total_count": 4,
+        "daily_score": daily_score,
         "daily_pass": bool(ok_count >= cfg.daily_min_ok),
         "close": close,
         "ma25": ma25,
