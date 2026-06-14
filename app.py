@@ -32,7 +32,7 @@ from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
 from pattern_stats import calculate_pattern_stats
-from replay_engine import apply_replay_money_metrics, run_replay, summarize_replay_money
+from replay_engine import apply_replay_money_metrics, run_replay, summarize_replay_money, summarize_replay_results
 from replay_store import insert_replay_run, insert_replay_trades, load_replay_trades
 from scanner import (
     append_trade_candidate,
@@ -2689,18 +2689,32 @@ def _replay_group_performance_table(trades: List[Dict[str, Any]], group_key: str
     if not trades:
         return pd.DataFrame()
     rows = []
-    values = sorted({str(trade.get(group_key, "-")) for trade in trades})
+    values = sorted({str(trade.get(group_key, "-") or "-") for trade in trades})
     for value in values:
-        scoped = [trade for trade in trades if str(trade.get(group_key, "-")) == value]
+        scoped = [trade for trade in trades if str(trade.get(group_key, "-") or "-") == value]
+        scoped_with_money = apply_replay_money_metrics(scoped, shares)
         perf = summarize_replay_results(scoped)
-        money = summarize_replay_money(apply_replay_money_metrics(scoped, shares), shares)
+        money = summarize_replay_money(scoped_with_money, shares)
+        closed_money = [trade for trade in scoped_with_money if trade.get("profit_yen") is not None]
+        win_count = sum(1 for trade in closed_money if float(trade.get("profit_yen") or 0) > 0)
+        loss_count = sum(1 for trade in closed_money if float(trade.get("profit_yen") or 0) < 0)
         rows.append(
             {
                 label: value,
                 "仮想買い件数": len(scoped),
+                "確定損益対象": money.get("closed_trade_count", perf.get("closed_count", 0)),
+                "勝ち件数": win_count,
+                "負け件数": loss_count,
                 "勝率": _format_pct_value(perf.get("win_rate_pct")),
+                "累計利益": _format_signed_yen(money.get("gross_profit_yen")),
+                "累計損失": _format_signed_yen(money.get("gross_loss_yen")),
                 "純損益": _format_signed_yen(money.get("net_profit_yen")),
                 "損益比": _format_profit_loss_ratio(money.get("profit_loss_ratio")),
+                "平均利益": _format_signed_yen(money.get("average_profit_yen")),
+                "平均損失": _format_signed_yen(money.get("average_loss_yen")),
+                "最大利益": _format_signed_yen(money.get("max_profit_yen")),
+                "最大損失": _format_signed_yen(money.get("max_loss_yen")),
+                "最大連勝": money.get("max_win_streak", 0),
                 "最大連敗": money.get("max_loss_streak", 0),
             }
         )
