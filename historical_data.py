@@ -14,6 +14,7 @@ from data_fetcher import normalize_jp_symbol
 DATA_CACHE_DIR = BASE_DIR / "data_cache"
 REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 JST_TZ = "Asia/Tokyo"
+YFINANCE_AUTO_ADJUST = False
 
 
 @dataclass
@@ -108,6 +109,75 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.sort_index()
 
 
+def validate_historical_ohlcv(
+    df: pd.DataFrame,
+    close_jump_threshold_pct: float = 50.0,
+) -> dict:
+    if df is None or df.empty:
+        return {
+            "cleaned_data": pd.DataFrame(columns=REQUIRED_COLUMNS),
+            "original_rows": 0,
+            "cleaned_rows": 0,
+            "excluded_count": 0,
+            "invalid_ohlc_count": 0,
+            "non_positive_close_count": 0,
+            "close_jump_count": 0,
+            "warning_count": 0,
+            "warnings": [],
+            "anomalies": [],
+        }
+
+    data = df.copy().sort_index()
+    invalid_ohlc = data["High"] < data["Low"]
+    non_positive_close = data["Close"] <= 0
+    close_jump_pct = data["Close"].pct_change().abs() * 100
+    close_jump = close_jump_pct > float(close_jump_threshold_pct)
+    exclude_mask = invalid_ohlc | non_positive_close | close_jump.fillna(False)
+
+    anomalies = []
+    for ts, row in data[exclude_mask].head(50).iterrows():
+        reasons = []
+        if bool(invalid_ohlc.loc[ts]):
+            reasons.append("high < low")
+        if bool(non_positive_close.loc[ts]):
+            reasons.append("close <= 0")
+        if bool(close_jump.fillna(False).loc[ts]):
+            reasons.append(f"close急変 {close_jump_pct.loc[ts]:.1f}%")
+        anomalies.append(
+            {
+                "datetime": _format_timestamp(ts),
+                "open": row.get("Open"),
+                "high": row.get("High"),
+                "low": row.get("Low"),
+                "close": row.get("Close"),
+                "volume": row.get("Volume"),
+                "reason": " / ".join(reasons),
+            }
+        )
+
+    warnings = []
+    if int(invalid_ohlc.sum()):
+        warnings.append("HighがLowを下回る行があります。")
+    if int(non_positive_close.sum()):
+        warnings.append("Closeが0以下の行があります。")
+    if int(close_jump.sum()):
+        warnings.append(f"前後のClose比で{close_jump_threshold_pct:.0f}%超の急変バーがあります。")
+
+    cleaned = data.loc[~exclude_mask].copy()
+    return {
+        "cleaned_data": cleaned,
+        "original_rows": int(len(data)),
+        "cleaned_rows": int(len(cleaned)),
+        "excluded_count": int(exclude_mask.sum()),
+        "invalid_ohlc_count": int(invalid_ohlc.sum()),
+        "non_positive_close_count": int(non_positive_close.sum()),
+        "close_jump_count": int(close_jump.sum()),
+        "warning_count": len(warnings),
+        "warnings": warnings,
+        "anomalies": anomalies,
+    }
+
+
 def save_historical_cache(symbol: object, period: str, interval: str, df: pd.DataFrame) -> Path:
     DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = _cache_path(symbol, period, interval)
@@ -160,7 +230,7 @@ def fetch_historical_data(symbol: object, period: str, interval: str) -> Histori
             normalized_symbol,
             period=period,
             interval=interval,
-            auto_adjust=False,
+            auto_adjust=YFINANCE_AUTO_ADJUST,
             progress=False,
             threads=False,
             prepost=False,

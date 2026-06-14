@@ -24,7 +24,7 @@ from config import (
     get_setting,
 )
 from data_fetcher import fetch_price_data, normalize_jp_symbol
-from historical_data import HistoricalDataResult, load_or_fetch_historical_data
+from historical_data import HistoricalDataResult, YFINANCE_AUTO_ADJUST, load_or_fetch_historical_data, validate_historical_ohlcv
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
 from notifier import format_yen
@@ -2215,6 +2215,8 @@ def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("score")),
                 "結果": _display_replay_outcome(trade.get("outcome")),
+                "終了時刻": trade.get("evaluated_until", "-"),
+                "終了価格": format_yen(trade.get("exit_price")),
                 "リターン": _format_pct_value(trade.get("return_pct")),
                 "最大利益率": _format_pct_value(trade.get("max_profit_pct")),
                 "最大下落率": _format_pct_value(trade.get("max_drawdown_pct")),
@@ -2233,6 +2235,8 @@ def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
             "利確目標",
             "スコア",
             "結果",
+            "終了時刻",
+            "終了価格",
             "リターン",
             "最大利益率",
             "最大下落率",
@@ -2259,7 +2263,52 @@ def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
     cols[2].metric("時間足", meta.get("interval_label", "-"))
     cols[3].metric("最初の日時", meta.get("first_timestamp", "-"))
     cols[4].metric("最後の日時", meta.get("last_timestamp", "-"))
-    st.caption(f"データ元：{'キャッシュ' if meta.get('from_cache') else 'yfinance'} / symbol={meta.get('normalized_symbol', '-')}")
+    st.caption(
+        f"データ元：{'キャッシュ' if meta.get('from_cache') else 'yfinance'} / "
+        f"symbol={meta.get('normalized_symbol', '-')} / auto_adjust={YFINANCE_AUTO_ADJUST}"
+    )
+
+
+def _render_replay_anomaly_summary(validation: Dict[str, Any]) -> None:
+    if not validation:
+        return
+    st.markdown("**異常値チェック結果**")
+    cols = st.columns(5)
+    cols[0].metric("元データ", f"{validation.get('original_rows', 0)}本")
+    cols[1].metric("除外バー", f"{validation.get('excluded_count', 0)}本")
+    cols[2].metric("High<Low", validation.get("invalid_ohlc_count", 0))
+    cols[3].metric("Close<=0", validation.get("non_positive_close_count", 0))
+    cols[4].metric("Close急変", validation.get("close_jump_count", 0))
+    warnings = validation.get("warnings") or []
+    if warnings:
+        st.warning(" / ".join(str(item) for item in warnings))
+    else:
+        st.success("異常値チェック: 大きな異常は見つかりませんでした。")
+
+
+def _replay_extreme_result_warnings(trades: List[Dict[str, Any]]) -> None:
+    large_drawdown = [
+        trade for trade in trades
+        if trade.get("max_drawdown_pct") is not None and float(trade.get("max_drawdown_pct")) <= -20
+    ]
+    large_profit = [
+        trade for trade in trades
+        if trade.get("max_profit_pct") is not None and float(trade.get("max_profit_pct")) >= 20
+    ]
+    if large_drawdown:
+        st.warning(f"最大下落率が-20%以下の結果が {len(large_drawdown)} 件あります。詳細デバッグ情報で確認してください。")
+    if large_profit:
+        st.warning(f"最大利益率が+20%以上の結果が {len(large_profit)} 件あります。詳細デバッグ情報で確認してください。")
+
+
+def _replay_debug_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for trade in trades:
+        debug = trade.get("debug") or {}
+        if not debug:
+            continue
+        rows.append(debug)
+    return pd.DataFrame(rows)
 
 
 def _render_replay_summary(summary: Dict[str, Any], saved_count: int) -> None:
@@ -2378,7 +2427,14 @@ def _render_historical_replay_tab() -> None:
     if fetch_cols[0].button("過去データ取得", key="fetch_historical_replay_data_button", type="primary"):
         with st.spinner("過去データを取得しています..."):
             result = load_or_fetch_historical_data(symbol, period, interval)
-        st.session_state["replay_data"] = result.data
+        validation = validate_historical_ohlcv(result.data)
+        st.session_state["replay_raw_data"] = result.data
+        st.session_state["replay_data"] = validation.get("cleaned_data", result.data)
+        st.session_state["replay_data_validation"] = {
+            key: value
+            for key, value in validation.items()
+            if key != "cleaned_data"
+        }
         st.session_state["replay_fetch_meta"] = _historical_result_to_meta(result, period_label, interval_label)
         st.session_state["replay_last_error"] = result.error_message or ""
 
@@ -2387,6 +2443,7 @@ def _render_historical_replay_tab() -> None:
     replay_data = st.session_state.get("replay_data", pd.DataFrame())
     fetch_meta = st.session_state.get("replay_fetch_meta", {})
     _render_replay_fetch_summary(fetch_meta)
+    _render_replay_anomaly_summary(st.session_state.get("replay_data_validation", {}))
 
     if replay_data is None or replay_data.empty:
         st.info("まだ過去データがありません。まず「過去データ取得」を押してください。")
@@ -2431,6 +2488,7 @@ def _render_historical_replay_tab() -> None:
                     "max_trades": int(max_trades),
                     "interval": interval,
                     "cooldown_bars": int(cooldown_bars),
+                    "debug": True,
                 },
             )
             store_result = insert_replay_trades(result["trades"])
@@ -2444,12 +2502,27 @@ def _render_historical_replay_tab() -> None:
         summary = last_result.get("summary", {})
         trades = last_result.get("trades", [])
         _render_replay_summary(summary, int(last_store.get("saved_count", 0)))
+        _replay_extreme_result_warnings(trades)
         _render_replay_chart(replay_data, trades)
         st.markdown("**リプレイ結果表**")
         if trades:
             st.dataframe(_safe_dataframe(_replay_result_table(trades)), width="stretch", hide_index=True)
         else:
             st.info("条件に一致する仮想買いポイントはありませんでした。")
+
+        with st.expander("詳細デバッグ情報", expanded=False):
+            debug_df = _replay_debug_table(trades)
+            if debug_df.empty:
+                st.info("デバッグ情報はありません。")
+            else:
+                st.dataframe(_safe_dataframe(debug_df), width="stretch", hide_index=True)
+            validation = st.session_state.get("replay_data_validation", {})
+            anomalies = validation.get("anomalies") or []
+            st.caption(f"除外バー件数: {validation.get('excluded_count', 0)}")
+            if anomalies:
+                st.dataframe(_safe_dataframe(pd.DataFrame(anomalies)), width="stretch", hide_index=True)
+            else:
+                st.caption("異常バー詳細はありません。")
 
     with st.expander("保存済みリプレイ結果", expanded=False):
         recent = load_replay_trades(limit=100)

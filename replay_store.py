@@ -30,6 +30,7 @@ REPLAY_COLUMNS = [
     "rule_name",
     "status",
     "outcome",
+    "exit_price",
     "return_pct",
     "max_profit_pct",
     "max_drawdown_pct",
@@ -68,6 +69,7 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
                 rule_name TEXT,
                 status TEXT,
                 outcome TEXT,
+                exit_price REAL,
                 return_pct REAL,
                 max_profit_pct REAL,
                 max_drawdown_pct REAL,
@@ -85,6 +87,7 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
             "holding_period": "TEXT",
             "exit_reason": "TEXT",
             "notes_json": "TEXT",
+            "exit_price": "REAL",
         }
         for column, column_type in migrations.items():
             if column not in existing:
@@ -118,6 +121,7 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
         "rule_name": str(record.get("rule_name", "")),
         "status": str(record.get("status", "")),
         "outcome": str(record.get("outcome", "")),
+        "exit_price": record.get("exit_price"),
         "return_pct": record.get("return_pct"),
         "max_profit_pct": record.get("max_profit_pct"),
         "max_drawdown_pct": record.get("max_drawdown_pct"),
@@ -134,12 +138,12 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
             INSERT INTO replay_trades (
                 replay_run_id, created_at_jst, symbol, name, replay_start_at, replay_end_at,
                 signal_time, entry_price, stop_loss, take_profit, score, entry_type, rule_name,
-                status, outcome, return_pct, max_profit_pct, max_drawdown_pct,
+                status, outcome, exit_price, return_pct, max_profit_pct, max_drawdown_pct,
                 hit_stop_loss, hit_take_profit, evaluated_until, holding_period, exit_reason, notes_json
             ) VALUES (
                 :replay_run_id, :created_at_jst, :symbol, :name, :replay_start_at, :replay_end_at,
                 :signal_time, :entry_price, :stop_loss, :take_profit, :score, :entry_type, :rule_name,
-                :status, :outcome, :return_pct, :max_profit_pct, :max_drawdown_pct,
+                :status, :outcome, :exit_price, :return_pct, :max_profit_pct, :max_drawdown_pct,
                 :hit_stop_loss, :hit_take_profit, :evaluated_until, :holding_period, :exit_reason, :notes_json
             )
             """,

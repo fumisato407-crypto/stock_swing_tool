@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -25,6 +24,7 @@ class ReplayRuleConfig:
     max_trades: int = 10
     interval: str = "5m"
     cooldown_bars: int = 12
+    debug: bool = False
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -59,6 +59,7 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
         max_trades=int(values.get("max_trades", 10) or 10),
         interval=str(values.get("interval", "5m") or "5m"),
         cooldown_bars=int(values.get("cooldown_bars", 12) or 12),
+        debug=bool(values.get("debug", False)),
     )
 
 
@@ -138,15 +139,18 @@ def evaluate_replay_trade_outcome(
     trade: Dict[str, Any],
     future_df: pd.DataFrame,
     interval: str = "5m",
+    debug: bool = False,
+    symbol: str = "",
 ) -> Dict[str, Any]:
     entry_price = _num(trade.get("entry_price"))
     stop_loss = _num(trade.get("stop_loss"), 0)
     take_profit = _num(trade.get("take_profit"), 0)
     max_bars = _max_hold_bars(interval)
     horizon = future_df.head(max_bars).copy()
+    signal_time = trade.get("signal_time")
 
     if horizon.empty or not entry_price:
-        return {
+        result = {
             "status": "open",
             "outcome": "open",
             "return_pct": None,
@@ -155,18 +159,29 @@ def evaluate_replay_trade_outcome(
             "hit_stop_loss": False,
             "hit_take_profit": False,
             "evaluated_until": "",
+            "exit_price": None,
             "holding_period": "-",
             "exit_reason": "検証中",
         }
+        if debug:
+            result["debug"] = {
+                "symbol": symbol,
+                "signal_time": signal_time,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "future_df_rows": 0,
+                "outcome": "open",
+            }
+        return result
 
-    max_profit_pct = _pct(float(horizon["High"].max()), entry_price)
-    max_drawdown_pct = _pct(float(horizon["Low"].min()), entry_price)
     return_pct = _pct(float(horizon["Close"].iloc[-1]), entry_price)
     outcome = "timeout"
     status = "closed"
     hit_stop = False
     hit_target = False
     evaluated_until = horizon.index[-1]
+    exit_price = float(horizon["Close"].iloc[-1])
     exit_reason = "timeout"
 
     for ts, row in horizon.iterrows():
@@ -177,6 +192,7 @@ def evaluate_replay_trade_outcome(
             outcome = "hit_stop_loss"
             return_pct = _pct(stop_loss, entry_price)
             evaluated_until = ts
+            exit_price = stop_loss
             exit_reason = "hit_stop_loss"
             break
         if take_profit and high >= take_profit:
@@ -184,6 +200,7 @@ def evaluate_replay_trade_outcome(
             outcome = "hit_take_profit"
             return_pct = _pct(take_profit, entry_price)
             evaluated_until = ts
+            exit_price = take_profit
             exit_reason = "hit_take_profit"
             break
 
@@ -192,11 +209,27 @@ def evaluate_replay_trade_outcome(
         outcome = "open"
         exit_reason = "検証中"
 
+    outcome_window = horizon.loc[horizon.index <= evaluated_until].copy()
+    if outcome_window.empty:
+        outcome_window = horizon.head(1).copy()
+
+    min_low = float(outcome_window["Low"].min())
+    max_high = float(outcome_window["High"].max())
+    min_low_time = outcome_window["Low"].idxmin()
+    max_high_time = outcome_window["High"].idxmax()
+    max_profit_pct = _pct(max_high, entry_price)
+    max_drawdown_pct = _pct(min_low, entry_price)
+
     signal_time = pd.Timestamp(trade.get("signal_time"))
     holding_delta = pd.Timestamp(evaluated_until) - signal_time
     holding_period = f"{holding_delta.days}日 {holding_delta.seconds // 3600}時間"
 
-    return {
+    anomaly_rows = outcome_window[
+        (outcome_window["High"] >= entry_price * 1.2)
+        | (outcome_window["Low"] <= entry_price * 0.8)
+    ]
+
+    result = {
         "status": status,
         "outcome": outcome,
         "return_pct": return_pct,
@@ -205,9 +238,36 @@ def evaluate_replay_trade_outcome(
         "hit_stop_loss": hit_stop,
         "hit_take_profit": hit_target,
         "evaluated_until": _timestamp_text(evaluated_until),
+        "exit_price": exit_price,
         "holding_period": holding_period,
         "exit_reason": exit_reason,
     }
+    if debug:
+        result["debug"] = {
+            "symbol": symbol,
+            "signal_time": _timestamp_text(signal_time),
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "future_df_start": _timestamp_text(horizon.index[0]),
+            "future_df_end": _timestamp_text(horizon.index[-1]),
+            "future_df_rows": len(horizon),
+            "outcome_window_start": _timestamp_text(outcome_window.index[0]),
+            "outcome_window_end": _timestamp_text(outcome_window.index[-1]),
+            "outcome_window_rows": len(outcome_window),
+            "min_low": min_low,
+            "min_low_time": _timestamp_text(min_low_time),
+            "max_high": max_high,
+            "max_high_time": _timestamp_text(max_high_time),
+            "exit_time": _timestamp_text(evaluated_until),
+            "exit_price": exit_price,
+            "outcome": outcome,
+            "return_pct": return_pct,
+            "max_profit_pct": max_profit_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "entry_relative_anomaly_count": len(anomaly_rows),
+        }
+    return result
 
 
 def run_replay(
@@ -253,7 +313,15 @@ def run_replay(
 
         trade = create_replay_trade(signal, current_bar, current_time)
         future = all_data.loc[all_data.index > current_time]
-        trade.update(evaluate_replay_trade_outcome(trade, future, interval=config.interval))
+        trade.update(
+            evaluate_replay_trade_outcome(
+                trade,
+                future,
+                interval=config.interval,
+                debug=config.debug,
+                symbol=symbol,
+            )
+        )
         trade.update(
             {
                 "symbol": symbol,
