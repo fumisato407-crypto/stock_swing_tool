@@ -11,7 +11,7 @@ from config import TRADES_PATH, WATCHLIST_PATH
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from indicators import add_indicators
 from intraday_scanner import fetch_intraday_data
-from multi_timeframe_rules import evaluate_multi_timeframe_signal
+from multi_timeframe_rules import evaluate_multi_timeframe_signal, evaluate_risk_filter
 from notifier import build_notification_text
 from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD, score_stock
 
@@ -81,13 +81,24 @@ def _apply_multi_timeframe_result(
     daily_filter = mtf.get("daily_filter", {})
     intraday_entry = mtf.get("intraday_entry", {})
     base_score = int(signal.get("score", 0) or 0)
+    risk_filter = evaluate_risk_filter(signal, shares=100)
+    risk_pass = bool(risk_filter.get("risk_pass"))
 
-    if decision == "buy":
+    if decision == "buy" and risk_pass:
         category = "買い候補"
         score = max(BUY_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score))
         entry_type = str(mtf.get("entry_type") or signal.get("entry_type") or "ブレイク狙い")
         wait_condition = signal.get("wait_condition", "-")
-        monitoring_reason = f"日足{daily_filter.get('daily_ok_count', 0)}/4 + 5分足{intraday_entry.get('intraday_ok_count', 0)}/4"
+        monitoring_reason = (
+            f"日足{daily_filter.get('daily_ok_count', 0)}/4 + "
+            f"5分足{intraday_entry.get('intraday_ok_count', 0)}/4 + リスクOK"
+        )
+    elif decision == "buy" and not risk_pass:
+        category = "監視"
+        score = min(BUY_SCORE_THRESHOLD - 1, max(WATCH_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score)))
+        entry_type = "リスク条件NG"
+        wait_condition = "損切り幅、最大損失、損益比の改善待ち"
+        monitoring_reason = "リスク条件NG: " + "、".join(risk_filter.get("risk_reasons", []))
     elif bool(daily_filter.get("daily_pass")):
         category = "監視"
         score = min(BUY_SCORE_THRESHOLD - 1, max(WATCH_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score)))
@@ -125,6 +136,14 @@ def _apply_multi_timeframe_result(
             "multi_timeframe_reasons": mtf.get("reasons", []),
             "intraday_error_type": intraday_error_type,
             "intraday_error_message": intraday_error_message,
+            "risk_filter": risk_filter,
+            "risk_filter_json": risk_filter.get("risk_filter_json", risk_filter),
+            "risk_pass": risk_pass,
+            "stop_loss_pct": risk_filter.get("stop_loss_pct"),
+            "max_loss_yen": risk_filter.get("max_loss_yen"),
+            "expected_profit_yen": risk_filter.get("expected_profit_yen"),
+            "risk_reward_ratio": risk_filter.get("risk_reward_ratio"),
+            "risk_reasons": risk_filter.get("risk_reasons", []),
         }
     )
     updated["score_breakdown"] = dict(updated.get("score_breakdown") or {})
@@ -139,6 +158,8 @@ def _apply_multi_timeframe_result(
         waits.append(wait_condition)
     if category == "触らない":
         negatives.append(monitoring_reason)
+    if not risk_pass:
+        negatives.extend(risk_filter.get("risk_reasons", []))
     updated["positive_reasons"] = list(dict.fromkeys(positives))
     updated["negative_reasons"] = list(dict.fromkeys(negatives))
     updated["wait_reasons"] = list(dict.fromkeys(waits))

@@ -21,6 +21,14 @@ class MultiTimeframeConfig:
     use_volume_spike: bool = True
 
 
+@dataclass
+class RiskFilterConfig:
+    enabled: bool = True
+    max_stop_loss_pct: float = 3.0
+    max_loss_yen_limit: float = 20000.0
+    min_risk_reward: float = 1.2
+
+
 def normalize_config(config: Optional[Dict[str, Any] | MultiTimeframeConfig]) -> MultiTimeframeConfig:
     if isinstance(config, MultiTimeframeConfig):
         return config
@@ -37,6 +45,18 @@ def normalize_config(config: Optional[Dict[str, Any] | MultiTimeframeConfig]) ->
         intraday_volume_multiplier=float(values.get("intraday_volume_multiplier", 1.5) or 1.5),
         use_vwap=bool(values.get("use_vwap", True)),
         use_volume_spike=bool(values.get("use_volume_spike", True)),
+    )
+
+
+def normalize_risk_config(config: Optional[Dict[str, Any] | RiskFilterConfig]) -> RiskFilterConfig:
+    if isinstance(config, RiskFilterConfig):
+        return config
+    values = dict(config or {})
+    return RiskFilterConfig(
+        enabled=bool(values.get("enabled", True)),
+        max_stop_loss_pct=float(values.get("max_stop_loss_pct", 3.0) or 3.0),
+        max_loss_yen_limit=float(values.get("max_loss_yen_limit", 20000.0) or 20000.0),
+        min_risk_reward=float(values.get("min_risk_reward", 1.2) or 1.2),
     )
 
 
@@ -243,6 +263,78 @@ def evaluate_intraday_entry(
         "avg_volume_12bars": avg_volume,
         "reasons": reasons,
     }
+
+
+def evaluate_risk_filter(
+    signal: Dict[str, Any],
+    shares: int = 100,
+    config: Optional[Dict[str, Any] | RiskFilterConfig] = None,
+) -> Dict[str, Any]:
+    cfg = normalize_risk_config(config)
+    share_count = int(shares or 100)
+    entry_price = _num(
+        signal.get("entry_price")
+        or signal.get("current_price")
+        or signal.get("price")
+        or signal.get("close")
+    )
+    stop_loss = _num(signal.get("stop_loss"))
+    take_profit = _num(signal.get("take_profit") or signal.get("take_profit_1") or signal.get("target_1"))
+
+    risk_reasons = []
+    if not entry_price:
+        risk_reasons.append("entry_priceが取得できない")
+    if not stop_loss or (entry_price and stop_loss >= entry_price):
+        risk_reasons.append("損切り価格が不正、または買値以上")
+    if not take_profit or (entry_price and take_profit <= entry_price):
+        risk_reasons.append("利確目標が不正、または買値以下")
+
+    stop_loss_pct = ((entry_price - stop_loss) / entry_price * 100) if entry_price and stop_loss else None
+    max_loss_yen = ((entry_price - stop_loss) * share_count) if entry_price and stop_loss else None
+    expected_profit_yen = ((take_profit - entry_price) * share_count) if entry_price and take_profit else None
+    risk_reward_ratio = (
+        expected_profit_yen / max_loss_yen
+        if expected_profit_yen is not None and max_loss_yen and max_loss_yen > 0
+        else None
+    )
+
+    stop_loss_pct_ok = bool(stop_loss_pct is not None and 0 < stop_loss_pct <= cfg.max_stop_loss_pct)
+    max_loss_yen_ok = bool(max_loss_yen is not None and 0 < max_loss_yen <= cfg.max_loss_yen_limit)
+    risk_reward_ok = bool(risk_reward_ratio is not None and risk_reward_ratio >= cfg.min_risk_reward)
+
+    if not stop_loss_pct_ok:
+        risk_reasons.append(f"損切り幅が{cfg.max_stop_loss_pct:.1f}%超")
+    if not max_loss_yen_ok:
+        risk_reasons.append(f"想定損失が{cfg.max_loss_yen_limit:,.0f}円超")
+    if not risk_reward_ok:
+        risk_reasons.append(f"損益比が{cfg.min_risk_reward:.2f}未満")
+
+    risk_pass = bool(stop_loss_pct_ok and max_loss_yen_ok and risk_reward_ok)
+    if not cfg.enabled:
+        risk_pass = True
+        risk_reasons = ["リスク条件OFF"]
+
+    result = {
+        "risk_pass": risk_pass,
+        "risk_filter_enabled": cfg.enabled,
+        "risk_entry_price": entry_price,
+        "risk_stop_loss": stop_loss,
+        "risk_take_profit": take_profit,
+        "risk_shares": share_count,
+        "stop_loss_pct": round(stop_loss_pct, 2) if stop_loss_pct is not None else None,
+        "max_loss_yen": round(max_loss_yen) if max_loss_yen is not None else None,
+        "expected_profit_yen": round(expected_profit_yen) if expected_profit_yen is not None else None,
+        "risk_reward_ratio": round(risk_reward_ratio, 2) if risk_reward_ratio is not None else None,
+        "max_stop_loss_pct": cfg.max_stop_loss_pct,
+        "max_loss_yen_limit": cfg.max_loss_yen_limit,
+        "min_risk_reward": cfg.min_risk_reward,
+        "stop_loss_pct_ok": stop_loss_pct_ok,
+        "max_loss_yen_ok": max_loss_yen_ok,
+        "risk_reward_ok": risk_reward_ok,
+        "risk_reasons": list(dict.fromkeys(risk_reasons)),
+    }
+    result["risk_filter_json"] = dict(result)
+    return result
 
 
 def evaluate_multi_timeframe_signal(

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from entry_rules import evaluate_intraday_entry
-from multi_timeframe_rules import build_replay_daily_context, evaluate_multi_timeframe_signal
+from multi_timeframe_rules import build_replay_daily_context, evaluate_multi_timeframe_signal, evaluate_risk_filter
 
 
 INTERVAL_MAX_HOLD_BARS = {
@@ -32,6 +32,11 @@ class ReplayRuleConfig:
     intraday_min_ok: int = 2
     use_vwap: bool = True
     use_volume_spike: bool = True
+    shares: int = DEFAULT_REPLAY_SHARES
+    use_risk_filter: bool = True
+    max_stop_loss_pct: float = 3.0
+    max_loss_yen_limit: float = 20000.0
+    min_risk_reward: float = 1.2
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -75,6 +80,11 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
         intraday_min_ok=_int_setting("intraday_min_ok", 2),
         use_vwap=bool(values.get("use_vwap", True)),
         use_volume_spike=bool(values.get("use_volume_spike", True)),
+        shares=_int_setting("shares", DEFAULT_REPLAY_SHARES),
+        use_risk_filter=bool(values.get("use_risk_filter", True)),
+        max_stop_loss_pct=float(values.get("max_stop_loss_pct", 3.0) or 3.0),
+        max_loss_yen_limit=float(values.get("max_loss_yen_limit", 20000.0) or 20000.0),
+        min_risk_reward=float(values.get("min_risk_reward", 1.2) or 1.2),
     )
 
 
@@ -84,6 +94,15 @@ def _multi_timeframe_config(config: ReplayRuleConfig) -> Dict[str, Any]:
         "intraday_min_ok": config.intraday_min_ok,
         "use_vwap": config.use_vwap,
         "use_volume_spike": config.use_volume_spike,
+    }
+
+
+def _risk_filter_config(config: ReplayRuleConfig) -> Dict[str, Any]:
+    return {
+        "enabled": config.use_risk_filter,
+        "max_stop_loss_pct": config.max_stop_loss_pct,
+        "max_loss_yen_limit": config.max_loss_yen_limit,
+        "min_risk_reward": config.min_risk_reward,
     }
 
 
@@ -159,6 +178,20 @@ def evaluate_replay_step(
         signal["intraday_entry_json"] = signal["intraday_entry"]
         signal["multi_timeframe_detail"] = mtf.get("detail_json", {})
         signal["reasons"] = list(dict.fromkeys(list(signal.get("reasons", [])) + list(mtf.get("reasons", []))))
+    risk_filter = evaluate_risk_filter(signal, shares=config.shares, config=_risk_filter_config(config))
+    signal["risk_filter"] = risk_filter
+    signal["risk_filter_json"] = risk_filter.get("risk_filter_json", risk_filter)
+    signal["risk_pass"] = risk_filter.get("risk_pass")
+    signal["stop_loss_pct"] = risk_filter.get("stop_loss_pct")
+    signal["max_loss_yen"] = risk_filter.get("max_loss_yen")
+    signal["expected_profit_yen"] = risk_filter.get("expected_profit_yen")
+    signal["risk_reward_ratio"] = risk_filter.get("risk_reward_ratio")
+    signal["risk_reasons"] = risk_filter.get("risk_reasons", [])
+    if config.use_risk_filter and not risk_filter.get("risk_pass"):
+        signal["judgement"] = "監視強化"
+        signal["replay_skip_reason"] = "risk_filter_ng"
+        signal["risk_exclusion_reason"] = "、".join(risk_filter.get("risk_reasons", []))
+        return signal
     score = int(signal.get("intraday_score", 0) or 0)
     signal_type = str(signal.get("signal_type", ""))
     if score < config.min_score:
@@ -190,6 +223,13 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "daily_filter_json": signal.get("daily_filter_json", signal.get("daily_filter", {})),
         "intraday_entry_json": signal.get("intraday_entry_json", signal.get("intraday_entry", {})),
         "multi_timeframe_pass": signal.get("multi_timeframe_pass"),
+        "risk_pass": signal.get("risk_pass"),
+        "stop_loss_pct": signal.get("stop_loss_pct"),
+        "max_loss_yen": signal.get("max_loss_yen"),
+        "expected_profit_yen": signal.get("expected_profit_yen"),
+        "risk_reward_ratio": signal.get("risk_reward_ratio"),
+        "risk_filter_json": signal.get("risk_filter_json", signal.get("risk_filter", {})),
+        "risk_reasons": signal.get("risk_reasons", []),
         "signal": {
             key: value
             for key, value in signal.items()
@@ -209,7 +249,8 @@ def evaluate_replay_trade_outcome(
     stop_loss = _num(trade.get("stop_loss"), 0)
     take_profit = _num(trade.get("take_profit"), 0)
     max_bars = _max_hold_bars(interval)
-    horizon = future_df.head(max_bars).copy()
+    horizon = pd.DataFrame() if future_df is None else future_df.copy().sort_index().head(max_bars)
+    future_len = 0 if future_df is None else len(future_df)
     signal_time = trade.get("signal_time")
 
     if horizon.empty or not entry_price:
@@ -222,6 +263,7 @@ def evaluate_replay_trade_outcome(
             "hit_stop_loss": False,
             "hit_take_profit": False,
             "evaluated_until": "",
+            "exit_time": "",
             "exit_price": None,
             "holding_period": "-",
             "exit_reason": "検証中",
@@ -250,6 +292,8 @@ def evaluate_replay_trade_outcome(
     for ts, row in horizon.iterrows():
         low = _num(row.get("Low"))
         high = _num(row.get("High"))
+        # Conservative assumption: if one candle touches both stop and target,
+        # the stop-loss is treated as hit first.
         if stop_loss and low <= stop_loss:
             hit_stop = True
             outcome = "hit_stop_loss"
@@ -267,7 +311,7 @@ def evaluate_replay_trade_outcome(
             exit_reason = "hit_take_profit"
             break
 
-    if len(future_df) < max_bars and outcome == "timeout":
+    if future_len < max_bars and outcome == "timeout":
         status = "open"
         outcome = "open"
         exit_reason = "検証中"
@@ -301,6 +345,7 @@ def evaluate_replay_trade_outcome(
         "hit_stop_loss": hit_stop,
         "hit_take_profit": hit_target,
         "evaluated_until": _timestamp_text(evaluated_until),
+        "exit_time": _timestamp_text(evaluated_until),
         "exit_price": exit_price,
         "holding_period": holding_period,
         "exit_reason": exit_reason,

@@ -788,6 +788,35 @@ def _intraday_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool
     return _condition_table(rows), bool(intraday_ok)
 
 
+def _risk_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool | None]:
+    saved = signal.get("risk_filter") or signal.get("risk_filter_json")
+    if not isinstance(saved, dict) or not saved:
+        rows = [
+            {"条件": "損切り幅", "判定": "未取得", "補足": "リスク条件未計算"},
+            {"条件": "最大損失", "判定": "未取得", "補足": "リスク条件未計算"},
+            {"条件": "損益比", "判定": "未取得", "補足": "リスク条件未計算"},
+        ]
+        return _condition_table(rows), None
+    rows = [
+        {
+            "条件": "損切り幅",
+            "判定": _condition_status(bool(saved.get("stop_loss_pct_ok"))),
+            "補足": f"{_format_plain_pct(saved.get('stop_loss_pct'))} / 上限 {_format_plain_pct(saved.get('max_stop_loss_pct'))}",
+        },
+        {
+            "条件": "最大損失",
+            "判定": _condition_status(bool(saved.get("max_loss_yen_ok"))),
+            "補足": f"{_format_plain_yen(saved.get('max_loss_yen'))} / 上限 {_format_plain_yen(saved.get('max_loss_yen_limit'))}",
+        },
+        {
+            "条件": "損益比",
+            "判定": _condition_status(bool(saved.get("risk_reward_ok"))),
+            "補足": f"{_format_profit_loss_ratio(saved.get('risk_reward_ratio'))} / 最低 {_format_profit_loss_ratio(saved.get('min_risk_reward'))}",
+        },
+    ]
+    return _condition_table(rows), bool(saved.get("risk_pass"))
+
+
 def _combined_judgement_text(daily_ok: bool | None, intraday_ok: bool | None) -> str:
     if daily_ok is None and intraday_ok is None:
         return "判定データが不足しています。"
@@ -806,6 +835,7 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     st.markdown("**判定内訳**")
     daily_df, daily_ok = _daily_condition_rows(signal)
     intraday_df, intraday_ok = _intraday_condition_rows(signal)
+    risk_df, risk_ok = _risk_condition_rows(signal)
     metric_cols = st.columns(3)
     metric_cols[0].metric(
         "日足",
@@ -816,14 +846,19 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
         f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
     )
     metric_cols[2].metric("統合判定", signal.get("category") or signal.get("judgement", "-"))
-    cols = st.columns(2)
+    cols = st.columns(3)
     with cols[0]:
         st.caption("日足フィルター")
         st.dataframe(daily_df, width="stretch", hide_index=True)
     with cols[1]:
         st.caption("5分足エントリー")
         st.dataframe(intraday_df, width="stretch", hide_index=True)
+    with cols[2]:
+        st.caption("リスク条件")
+        st.dataframe(risk_df, width="stretch", hide_index=True)
     st.caption(f"判定: {_combined_judgement_text(daily_ok, intraday_ok)}")
+    if risk_ok is False:
+        st.warning("リスク条件NG: " + "、".join(str(item) for item in signal.get("risk_reasons", [])))
 
 
 def _render_logic_confirmation_section() -> None:
@@ -843,6 +878,7 @@ def _render_logic_confirmation_section() -> None:
                     {"条件": "5分足直近高値突破", "判定": "使用", "補足": "現在足を除く過去12本高値を突破"},
                     {"条件": "押し目反発", "判定": "使用", "補足": "VWAP付近への押し後に再上抜け"},
                     {"条件": "出来高急増", "判定": "使用", "補足": "5分足出来高 >= 過去12本平均の1.5倍"},
+                    {"条件": "リスク条件", "判定": "使用", "補足": "損切り幅3%以内、想定損失2万円以内、損益比1.2以上"},
                 ]
             ),
             width="stretch",
@@ -1593,6 +1629,15 @@ def _format_signed_yen(value: Any) -> str:
 
 def _format_plain_yen(value: Any) -> str:
     return format_yen(value)
+
+
+def _format_plain_pct(value: Any) -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return "-"
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def _format_elapsed_days(value: Any) -> str:
@@ -2523,6 +2568,9 @@ def _display_replay_outcome(value: Any) -> str:
         "open": "検証中",
         "hit_take_profit": "利確到達",
         "hit_stop_loss": "損切り到達",
+        "take_profit_hit": "利確到達",
+        "stop_loss_hit": "損切り到達",
+        "time_exit": "期限到達",
         "timeout": "期限到達",
     }.get(str(value or ""), str(value or "-"))
 
@@ -2555,8 +2603,14 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
                 "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
                 "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
                 "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
+                "損切り幅": _format_plain_pct(trade.get("stop_loss_pct")),
+                "最大損失": _format_plain_yen(trade.get("max_loss_yen")),
+                "想定利益": _format_signed_yen(trade.get("expected_profit_yen")),
+                "損益比": _format_profit_loss_ratio(trade.get("risk_reward_ratio")),
+                "リスク判定": _display_risk_pass(trade.get("risk_pass")),
+                "リスク除外理由": _risk_reason_text(trade),
                 "結果": _display_replay_outcome(trade.get("outcome")),
-                "終了時刻": trade.get("evaluated_until", "-"),
+                "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
                 "損益円": _format_signed_yen(trade.get("profit_yen")),
                 "累計損益": _format_signed_yen(trade.get("cumulative_profit_yen")),
@@ -2582,6 +2636,12 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             "日足OK",
             "5分足OK",
             "マルチ通過",
+            "損切り幅",
+            "最大損失",
+            "想定利益",
+            "損益比",
+            "リスク判定",
+            "リスク除外理由",
             "結果",
             "終了時刻",
             "終了価格",
@@ -2622,9 +2682,15 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
                 "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
                 "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
+                "損切り幅": _format_plain_pct(trade.get("stop_loss_pct")),
+                "最大損失": _format_plain_yen(trade.get("max_loss_yen")),
+                "想定利益": _format_signed_yen(trade.get("expected_profit_yen")),
+                "損益比": _format_profit_loss_ratio(trade.get("risk_reward_ratio")),
+                "リスク判定": _display_risk_pass(trade.get("risk_pass")),
                 "結果": _display_replay_outcome(trade.get("outcome")),
-                "終了時刻": trade.get("evaluated_until", "-"),
+                "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
+                "終了理由": _display_replay_outcome(trade.get("exit_reason")),
                 "リターン": _format_pct_value(trade.get("return_pct")),
                 "株数": f"{trade.get('shares', shares)}株",
                 "必要資金": _format_plain_yen(trade.get("required_capital_yen")),
@@ -2645,9 +2711,15 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "日足OK",
         "5分足OK",
         "マルチ通過",
+        "損切り幅",
+        "最大損失",
+        "想定利益",
+        "損益比",
+        "リスク判定",
         "結果",
         "終了時刻",
         "終了価格",
+        "終了理由",
         "リターン",
         "株数",
         "必要資金",
@@ -2746,6 +2818,61 @@ def _render_multi_timeframe_performance(trades: List[Dict[str, Any]], shares: in
         st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "multi_pass_group", "マルチ判定", shares)), width="stretch", hide_index=True)
 
 
+def _stop_loss_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未計算"
+    if number < 1:
+        return "0〜1%"
+    if number < 2:
+        return "1〜2%"
+    if number <= 3:
+        return "2〜3%"
+    return "3%以上"
+
+
+def _max_loss_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未計算"
+    if number <= 10000:
+        return "1万円以内"
+    if number <= 20000:
+        return "2万円以内"
+    if number <= 30000:
+        return "3万円以内"
+    return "3万円超"
+
+
+def _render_risk_performance(trades: List[Dict[str, Any]], shares: int) -> None:
+    if not trades:
+        return
+    prepared = []
+    for trade in trades:
+        row = dict(trade)
+        risk_status = _display_risk_pass(row.get("risk_pass"))
+        row["risk_pass_group"] = "リスクOK" if risk_status == "OK" else ("リスクNG" if risk_status == "NG" else "未計算")
+        row["stop_loss_bucket"] = _stop_loss_bucket(row.get("stop_loss_pct"))
+        row["max_loss_bucket"] = _max_loss_bucket(row.get("max_loss_yen"))
+        prepared.append(row)
+
+    st.markdown("**リスク条件別 成績**")
+    risk_ok = [trade for trade in prepared if trade.get("risk_pass")]
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("リスクOKのみの成績")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(risk_ok, "risk_pass_group", "リスク判定", shares)), width="stretch", hide_index=True)
+        st.caption("損切り幅別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "stop_loss_bucket", "損切り幅", shares)), width="stretch", hide_index=True)
+    with cols[1]:
+        st.caption("リスクOK/NG別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "risk_pass_group", "リスク判定", shares)), width="stretch", hide_index=True)
+        st.caption("最大損失額別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "max_loss_bucket", "最大損失", shares)), width="stretch", hide_index=True)
+
+
 def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
     if not meta:
         return
@@ -2828,6 +2955,27 @@ def _format_profit_loss_ratio(value: Any) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return "-"
+
+
+def _display_risk_pass(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    if isinstance(value, str):
+        if value.strip() in {"1", "True", "true", "OK"}:
+            return "OK"
+        if value.strip() in {"0", "False", "false", "NG"}:
+            return "NG"
+    return "OK" if bool(value) else "NG"
+
+
+def _risk_reason_text(trade: Dict[str, Any]) -> str:
+    reasons = trade.get("risk_reasons")
+    if isinstance(reasons, list) and reasons:
+        return "、".join(str(item) for item in reasons)
+    risk_filter = trade.get("risk_filter")
+    if isinstance(risk_filter, dict) and risk_filter.get("risk_reasons"):
+        return "、".join(str(item) for item in risk_filter.get("risk_reasons", []))
+    return "-"
 
 
 def _render_replay_money_summary(money_summary: Dict[str, Any]) -> None:
@@ -3108,6 +3256,18 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     use_vwap = "VWAP" in mtf_options
     use_volume_spike = "出来高急増" in mtf_options
 
+    risk_cols = st.columns(4)
+    use_risk_filter = risk_cols[0].toggle("リスク条件を使う", value=True, key="historical_scan_use_risk_filter")
+    max_stop_loss_pct = float(
+        risk_cols[1].number_input("最大損切り幅 %", min_value=0.1, max_value=20.0, value=3.0, step=0.1, key="historical_scan_max_stop_loss_pct")
+    )
+    max_loss_yen_limit = float(
+        risk_cols[2].number_input("最大損失 円", min_value=1000, max_value=500000, value=20000, step=1000, key="historical_scan_max_loss_yen_limit")
+    )
+    min_risk_reward = float(
+        risk_cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="historical_scan_min_risk_reward")
+    )
+
     max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
     target_records = watchlist.to_dict("records")[: max_symbols or len(watchlist)]
     if (max_symbols is None or int(max_symbols) > 30) and REPLAY_INTERVAL_OPTIONS[interval_label] == "5m":
@@ -3148,6 +3308,10 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 intraday_min_ok=int(intraday_min_ok),
                 use_vwap=bool(use_vwap),
                 use_volume_spike=bool(use_volume_spike),
+                use_risk_filter=bool(use_risk_filter),
+                max_stop_loss_pct=max_stop_loss_pct,
+                max_loss_yen_limit=max_loss_yen_limit,
+                min_risk_reward=min_risk_reward,
             )
             result = run_historical_scan_replay(target_records, config, progress_callback=_progress)
             store_result = insert_replay_trades(
@@ -3192,6 +3356,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         hide_index=True,
     )
     _render_multi_timeframe_performance(trades, int(result["summary"].get("shares", shares)))
+    _render_risk_performance(trades, int(result["summary"].get("shares", shares)))
 
     _render_historical_scan_rankings(symbol_summary)
 
@@ -3291,6 +3456,18 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     use_vwap = "VWAP" in option_pack
     use_volume_spike = "出来高急増" in option_pack
 
+    risk_cols = st.columns(4)
+    replay_use_risk_filter = risk_cols[0].toggle("リスク条件を使う", value=True, key="replay_use_risk_filter")
+    replay_max_stop_loss_pct = float(
+        risk_cols[1].number_input("最大損切り幅 %", min_value=0.1, max_value=20.0, value=3.0, step=0.1, key="replay_max_stop_loss_pct")
+    )
+    replay_max_loss_yen_limit = float(
+        risk_cols[2].number_input("最大損失 円", min_value=1000, max_value=500000, value=20000, step=1000, key="replay_max_loss_yen_limit")
+    )
+    replay_min_risk_reward = float(
+        risk_cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="replay_min_risk_reward")
+    )
+
     start_at = _combine_date_time(start_date, start_time)
     end_at = _combine_date_time(end_date, end_time)
     run_disabled = start_at >= end_at
@@ -3318,6 +3495,11 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
                     "intraday_min_ok": int(intraday_min_ok),
                     "use_vwap": bool(use_vwap),
                     "use_volume_spike": bool(use_volume_spike),
+                    "shares": int(replay_shares),
+                    "use_risk_filter": bool(replay_use_risk_filter),
+                    "max_stop_loss_pct": replay_max_stop_loss_pct,
+                    "max_loss_yen_limit": replay_max_loss_yen_limit,
+                    "min_risk_reward": replay_min_risk_reward,
                 },
             )
             result["trades"] = apply_replay_money_metrics(result["trades"], replay_shares)
@@ -3344,6 +3526,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
         if trades:
             st.dataframe(_safe_dataframe(_replay_result_table(trades, display_shares)), width="stretch", hide_index=True)
             _render_multi_timeframe_performance(trades, display_shares)
+            _render_risk_performance(trades, display_shares)
         else:
             st.info("条件に一致する仮想買いポイントはありませんでした。")
 

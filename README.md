@@ -507,6 +507,17 @@ Windowsタスクスケジューラの例:
 - 買い判定では、その時点以前のローソク足だけを使います。未来の高値、安値、終値は買い判断に使いません。
 - 未来データは、利確、損切り、期限到達などの結果検証にだけ使います。
 
+決済判定:
+
+- 仮想買い後は、entry後の5分足を時系列順に確認します。
+- 各足で`Low <= stop_loss`になった時点で即損切り終了します。
+- 損切り時は`exit_time`をその足の時刻、`exit_price`を`stop_loss`、`outcome`を`hit_stop_loss`として保存します。
+- 各足で`High >= take_profit`になった時点で即利確終了します。
+- 利確時は`exit_time`をその足の時刻、`exit_price`を`take_profit`、`outcome`を`hit_take_profit`として保存します。
+- 同じ5分足で損切りと利確の両方に到達した場合は、保守的に損切りを優先します。
+- `max_drawdown_pct`と`max_profit_pct`は、entry後から`exit_time`までの範囲だけで計算します。決済後の未来データは含めません。
+- どちらにも到達しない場合だけ、保有期限または検証終了時点まで評価します。
+
 単一銘柄リプレイの使い方:
 
 1. `過去リプレイ検証`タブを開きます。
@@ -612,17 +623,44 @@ watchlist過去スキャン再現の注意:
 
 通常株価スキャンでの使われ方:
 
-- 日足3/4以上 + 5分足2/4以上なら`買い候補`です。
+- 日足3/4以上 + 5分足2/4以上 + リスク条件OKなら`買い候補`です。
 - 日足3/4以上 + 5分足未達、または5分足未取得なら`監視`です。
+- 日足3/4以上 + 5分足2/4以上でも、リスク条件NGなら`監視`として扱います。
 - 日足フィルター未達なら`触らない`です。
 
 過去リプレイ検証、watchlist過去スキャン再現での使われ方:
 
 - UIから`マルチ時間足判定を使う`をON/OFFできます。
 - 日足OK数、5分足OK数、VWAP条件、出来高急増条件を画面から変更できます。
+- UIから`リスク条件を使う`をON/OFFできます。
 - 買い判定では未来データを使いません。
 - 結果検証では、entry後の未来データだけを使って利確、損切り、期限到達を判定します。
 - 結果は`replay_trades.db`へ保存され、`daily_filter_json`、`intraday_entry_json`、`multi_timeframe_pass`も残ります。
+
+## リスク条件フィルター
+
+リスク条件フィルターは、マルチ時間足の買い形が出ていても、損切り幅や想定損失が大きすぎる候補を買い候補から外すためのpaper trading向けフィルターです。実売買、発注、自動売買ではありません。OpenAI APIも使いません。
+
+初期値:
+
+- 最大損切り幅: 3.0%以内
+- 最大損失額: 20,000円以内
+- 最低損益比: 1.2以上
+
+計算:
+
+- `stop_loss_pct = (entry_price - stop_loss) / entry_price * 100`
+- `max_loss_yen = (entry_price - stop_loss) * shares`
+- `expected_profit_yen = (take_profit - entry_price) * shares`
+- `risk_reward_ratio = expected_profit_yen / max_loss_yen`
+
+判定:
+
+- 日足条件OK、5分足条件OK、リスク条件OKの3つを満たした場合だけ`買い候補`です。
+- 日足OK + 5分足OKでも、損切り幅、最大損失、損益比のどれかがNGなら`監視`または過去検証では除外対象です。
+- リスク条件OFFの場合は、従来どおり日足 + 5分足の条件だけで判定します。
+- リプレイ結果表には、損切り幅、最大損失、想定利益、損益比、リスク判定を表示します。
+- `replay_trades.db`には`risk_pass`、`stop_loss_pct`、`max_loss_yen`、`expected_profit_yen`、`risk_reward_ratio`、`risk_filter_json`を保存します。
 
 ## バックテスト
 

@@ -42,6 +42,10 @@ class HistoricalScanReplayConfig:
     intraday_min_ok: int = 2
     use_vwap: bool = True
     use_volume_spike: bool = True
+    use_risk_filter: bool = True
+    max_stop_loss_pct: float = 3.0
+    max_loss_yen_limit: float = 20000.0
+    min_risk_reward: float = 1.2
 
 
 def _timestamp_text(value: Any) -> str:
@@ -267,6 +271,11 @@ def run_historical_scan_replay(
         intraday_min_ok=config.intraday_min_ok,
         use_vwap=config.use_vwap,
         use_volume_spike=config.use_volume_spike,
+        shares=config.shares,
+        use_risk_filter=config.use_risk_filter,
+        max_stop_loss_pct=config.max_stop_loss_pct,
+        max_loss_yen_limit=config.max_loss_yen_limit,
+        min_risk_reward=config.min_risk_reward,
     )
 
     for step_index, scan_time in enumerate(scan_times, start=1):
@@ -373,6 +382,10 @@ def run_historical_scan_replay(
         "intraday_min_ok": config.intraday_min_ok,
         "use_vwap": config.use_vwap,
         "use_volume_spike": config.use_volume_spike,
+        "use_risk_filter": config.use_risk_filter,
+        "max_stop_loss_pct": config.max_stop_loss_pct,
+        "max_loss_yen_limit": config.max_loss_yen_limit,
+        "min_risk_reward": config.min_risk_reward,
         "total_scan_steps": total_scan_steps,
         "total_candidates": total_candidates,
         "total_trades": len(trades),
