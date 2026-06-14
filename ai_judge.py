@@ -228,9 +228,17 @@ def _validate_virtual_decision(raw: Dict[str, Any], fallback: Dict[str, Any]) ->
     }
 
 
-def judge_virtual_trade(signal: Dict[str, Any]) -> Dict[str, Any]:
+def judge_virtual_trade(signal: Dict[str, Any], use_openai: bool = False) -> Dict[str, Any]:
     """Return a JSON-safe virtual trading decision. This never places real orders."""
     fallback = _fallback_virtual_decision(signal)
+    if not use_openai:
+        return _fallback_virtual_decision(
+            signal,
+            fallback_reason="openai_disabled",
+            fallback_error_type="",
+            fallback_error_message="",
+        )
+
     api_key = get_setting("OPENAI_API_KEY", "")
     if not api_key:
         return _fallback_virtual_decision(signal, fallback_reason="missing_openai_api_key")

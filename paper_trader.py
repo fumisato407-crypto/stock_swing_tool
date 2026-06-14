@@ -78,15 +78,15 @@ def build_virtual_trade_record(
         "model_used": model_used,
         "is_ai_generated": 1 if is_ai_generated else 0,
         "judge_source": judge_source,
-        "fallback_reason": decision.get("fallback_reason", ""),
-        "fallback_error_type": decision.get("fallback_error_type", ""),
-        "fallback_error_message": decision.get("fallback_error_message", ""),
+        "fallback_reason": decision.get("fallback_reason") or "",
+        "fallback_error_type": decision.get("fallback_error_type") or "",
+        "fallback_error_message": decision.get("fallback_error_message") or "",
     }
 
 
-def process_virtual_trade_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = False) -> Dict[str, Any]:
     snapshot = build_market_snapshot(signal)
-    decision = judge_virtual_trade(signal)
+    decision = judge_virtual_trade(signal, use_openai=use_openai)
     record = build_virtual_trade_record(signal, decision, snapshot)
     db_path = str(VIRTUAL_TRADES_DB_PATH)
 
@@ -125,11 +125,11 @@ def process_virtual_trade_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def process_virtual_trade_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def process_virtual_trade_signals(signals: List[Dict[str, Any]], use_openai: bool = False) -> List[Dict[str, Any]]:
     results = []
     for signal in signals:
         try:
-            results.append(process_virtual_trade_signal(signal))
+            results.append(process_virtual_trade_signal(signal, use_openai=use_openai))
         except Exception as exc:
             results.append(
                 {

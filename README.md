@@ -52,7 +52,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-OpenAI APIキーは任意です。通常の株価スキャン、スコア計算、候補コメント生成ではOpenAI APIを呼びません。
+OpenAI APIキーは任意です。`OPENAI_API_ENABLED=false`がデフォルトなので、APIキーが入っていても通常の株価スキャン、スコア計算、候補コメント生成、ルールベース仮想ログ保存ではOpenAI APIを呼びません。
 
 ## ローカル起動
 
@@ -237,6 +237,7 @@ App settings → Secrets
 
 ```toml
 OPENAI_API_KEY = ""
+OPENAI_API_ENABLED = false
 OPENAI_MODEL = "gpt-4o-mini"
 AI_VIRTUAL_MODEL = "gpt-5.5"
 JQUANTS_EMAIL = ""
@@ -399,13 +400,19 @@ AIに渡す情報:
 OpenAI API:
 
 - ローカルでは`.env`、Streamlit CloudではSecretsに`OPENAI_API_KEY`を設定します。
+- `OPENAI_API_ENABLED=false`がデフォルトです。
+- APIキーが入っていても、`OPENAI_API_ENABLED=false`または画面の「OpenAI API使用」がOFFならGPT判断は呼びません。
+- ルールベース仮想ログ保存ではOpenAI APIを呼ばないため、API料金は発生しません。
+- GPT判断を使う時だけ、Secretsまたは`.env`で`OPENAI_API_ENABLED=true`にするか、画面の「OpenAI API使用」をONにします。
+- ChatGPT Plusの月額料金とOpenAI APIの従量課金は別です。GPT判断をONにするとAPI側の課金対象になります。
 - AI仮想取引のモデルは`AI_VIRTUAL_MODEL`で指定できます。初期値は`gpt-5.5`です。
 - 通常の株価スキャン、スコア計算、候補コメント生成ではOpenAI APIを呼びません。
-- OpenAI APIを呼ぶのは、`OpenAI接続テスト`、または`AI仮想判断を実行`を押した時だけです。
+- OpenAI APIを呼ぶのは、OpenAI API使用がONの状態で`OpenAI接続テスト`、または`AI仮想判断を実行`を押した時だけです。
 - 画面上の`openai_call_count`で、現在のセッション内のOpenAI API呼び出し回数を確認できます。
 - 初期表示直後は`openai_call_count=0`です。
 - APIキーがない、またはAPI呼び出しに失敗した場合は、アプリが落ちないようにルールベースの仮想判断へフォールバックします。
 - APIキーや秘密情報は画面、ログ、DBに表示しません。
+- APIキーはGitHubにコミットしないでください。`.env`と`.streamlit/secrets.toml`は`.gitignore`で除外します。
 - OpenAI APIキーなしで保存した仮想判断は、`judge_source=fallback`、`model_used=rule_based_fallback`、`is_ai_generated=0`として記録されます。
 
 成績表示:

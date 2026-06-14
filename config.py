@@ -45,6 +45,13 @@ def get_setting(name: str, default: str = "") -> str:
     return default
 
 
+def get_bool_setting(name: str, default: bool = False) -> bool:
+    value = get_setting(name, "true" if default else "false")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
 DEFAULT_PRICE_PERIOD = get_setting("PRICE_PERIOD", "6mo")
 NOTIFICATION_CHANNEL = get_setting("NOTIFICATION_CHANNEL", "console")
 DISCORD_WEBHOOK_URL = get_setting("DISCORD_WEBHOOK_URL", "")
@@ -52,3 +59,4 @@ DISCORD_MENTION_ID = get_setting("DISCORD_MENTION_ID", "")
 OPENAI_API_KEY = get_setting("OPENAI_API_KEY", "")
 OPENAI_MODEL = get_setting("OPENAI_MODEL", "gpt-4o-mini")
 AI_VIRTUAL_MODEL = get_setting("AI_VIRTUAL_MODEL", "gpt-5.5")
+OPENAI_API_ENABLED = get_bool_setting("OPENAI_API_ENABLED", False)

@@ -12,7 +12,15 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from alert_builder import alert_key, append_alert_log, build_buy_candidate_discord_text, send_discord_webhook
-from config import AI_VIRTUAL_MODEL, ALERTS_LOG_PATH, DEFAULT_PRICE_PERIOD, TRADES_PATH, VIRTUAL_TRADES_DB_PATH, get_setting
+from config import (
+    AI_VIRTUAL_MODEL,
+    ALERTS_LOG_PATH,
+    DEFAULT_PRICE_PERIOD,
+    OPENAI_API_ENABLED,
+    TRADES_PATH,
+    VIRTUAL_TRADES_DB_PATH,
+    get_setting,
+)
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from notifier import format_yen
@@ -1264,6 +1272,19 @@ def _current_ai_virtual_model() -> str:
     return get_setting("AI_VIRTUAL_MODEL", AI_VIRTUAL_MODEL)
 
 
+def _initialize_openai_api_enabled_state() -> None:
+    if "openai_api_enabled_ui" not in st.session_state:
+        st.session_state["openai_api_enabled_ui"] = bool(OPENAI_API_ENABLED)
+
+
+def _openai_api_enabled() -> bool:
+    return bool(st.session_state.get("openai_api_enabled_ui", OPENAI_API_ENABLED))
+
+
+def _openai_mode_label() -> str:
+    return "GPT" if _openai_api_enabled() else "rule_based_fallback"
+
+
 def _increment_openai_call_count(amount: int = 1) -> None:
     st.session_state["openai_call_count"] = int(st.session_state.get("openai_call_count", 0)) + int(amount)
 
@@ -1272,6 +1293,17 @@ def _on_openai_connection_test_click() -> None:
     tested_at = now_jst_display()
     api_key = get_setting("OPENAI_API_KEY", "")
     model = _current_ai_virtual_model()
+    if not _openai_api_enabled():
+        st.session_state["openai_test_result"] = {
+            "status": "disabled",
+            "model_used": model,
+            "error_type": "",
+            "error_message": "",
+            "message": "OpenAI API使用がOFFのため接続テストは実行しません。ONにするとテストできます。",
+            "tested_at_jst": tested_at,
+        }
+        return
+
     if not api_key.strip():
         st.session_state["openai_test_result"] = {
             "status": "missing_key",
@@ -1310,6 +1342,10 @@ def _on_openai_connection_test_click() -> None:
 
 
 def _render_openai_connection_test_state() -> None:
+    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
+    st.caption(f"現在のAI仮想判断：{_openai_mode_label()}")
+    if not _openai_api_enabled():
+        st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
     st.markdown("**OpenAI接続テスト**")
     st.info("初期スキャンではOpenAI APIを呼びません。AI仮想判断ボタン、またはOpenAI接続テストを押した時だけ呼びます。")
     st.caption(f"OPENAI_API_KEY設定状態：{'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
@@ -1321,6 +1357,8 @@ def _render_openai_connection_test_state() -> None:
         return
     if result.get("status") == "ok":
         st.success("OpenAI接続テスト: ok")
+    elif result.get("status") == "disabled":
+        st.info("OpenAI connection test: disabled")
     elif result.get("status") == "missing_key":
         st.warning("OpenAI接続テスト: missing_key")
     else:
@@ -1331,6 +1369,7 @@ def _render_openai_connection_test_state() -> None:
             "model_used": result.get("model_used", ""),
             "error_type": result.get("error_type", ""),
             "error_message": result.get("error_message", ""),
+            "message": result.get("message", ""),
             "tested_at_jst": result.get("tested_at_jst", ""),
         }
     )
@@ -1413,10 +1452,11 @@ def _on_ai_virtual_db_test_click() -> None:
 def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = None) -> None:
     clicked_at = _mark_ai_virtual_callback_click("ai_virtual_run")
     candidates = list(candidates_snapshot or st.session_state.get("ai_virtual_candidates_snapshot", []))
+    use_openai = _openai_api_enabled()
     try:
-        if get_setting("OPENAI_API_KEY", "").strip():
+        if use_openai and get_setting("OPENAI_API_KEY", "").strip():
             _increment_openai_call_count(len(candidates))
-        results = process_virtual_trade_signals(candidates)
+        results = process_virtual_trade_signals(candidates, use_openai=use_openai)
         saved_count = sum(1 for result in results if result.get("saved"))
         failed_count = len(results) - saved_count
         _refresh_ai_virtual_db_debug_state()
@@ -1427,6 +1467,8 @@ def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = 
             "saved_count": saved_count,
             "failed_count": failed_count,
             "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "openai_api_enabled": use_openai,
+            "ai_virtual_mode": _openai_mode_label(),
             "event_label": "AI仮想判断コールバックを検知しました",
             "reason_summary": [result.get("reason", "") for result in results],
             "error": "",
@@ -1444,6 +1486,8 @@ def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = 
             "saved_count": 0,
             "failed_count": len(candidates),
             "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "openai_api_enabled": use_openai,
+            "ai_virtual_mode": _openai_mode_label(),
             "event_label": "AI仮想判断コールバックを検知しました",
             "reason_summary": [],
             "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}: {exc}",
@@ -1514,6 +1558,12 @@ def _render_ai_virtual_trade_tab(
     st.caption("GPTによるpaper trading / virtual trading専用です。実売買・発注・自動売買は行いません。")
 
     api_configured = bool(get_setting("OPENAI_API_KEY", "").strip())
+    st.caption(f"OpenAI APIキー：{'あり' if api_configured else 'なし'}")
+    st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
+    st.caption(f"現在のAI仮想判断：{_openai_mode_label()}")
+    st.caption(f"API呼び出し回数：{int(st.session_state.get('openai_call_count', 0))}")
+    if not _openai_api_enabled():
+        st.info("OpenAI API使用OFFのため、GPT判断は行わず、ルールベースで仮想取引ログを保存します。API料金は発生しません。")
     st.caption(f"OpenAI API設定：{'あり' if api_configured else 'なし（ルールベースで仮想判断）'}")
     st.caption(f"AI仮想取引モデル：{_current_ai_virtual_model()}")
     st.button(
@@ -1706,6 +1756,7 @@ def main() -> None:
         st.session_state["openai_call_count"] = 0
     if "latest_signals" not in st.session_state:
         st.session_state["latest_signals"] = []
+    _initialize_openai_api_enabled_state()
 
     with st.sidebar:
         st.header("設定")
@@ -1714,6 +1765,14 @@ def main() -> None:
         period = st.selectbox("株価取得期間", period_options, index=default_index)
         st.caption(f"買い候補: {BUY_SCORE_THRESHOLD}点以上 / 監視: {WATCH_SCORE_THRESHOLD}点以上")
         st.caption("初期スキャンではOpenAI APIを呼びません。")
+        st.checkbox(
+            "OpenAI API使用",
+            key="openai_api_enabled_ui",
+            help="OFFの場合、APIキーがあってもGPT判断は呼ばず、ルールベースfallbackで保存します。",
+        )
+        st.caption(f"OpenAI APIキー: {'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
+        st.caption(f"OpenAI API使用: {'ON' if _openai_api_enabled() else 'OFF'}")
+        st.caption(f"現在のAI仮想判断: {_openai_mode_label()}")
         st.caption(f"openai_call_count: {int(st.session_state.get('openai_call_count', 0))}")
         if "refresh_token" not in st.session_state:
             st.session_state.refresh_token = 0
