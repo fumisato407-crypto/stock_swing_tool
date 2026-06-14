@@ -174,6 +174,7 @@ HISTORICAL_SCAN_COOLDOWN_OPTIONS = {
     "当日中": "day",
 }
 DAILY_TOP_N_OPTIONS = [5, 10, 15, 20, 30]
+NORMAL_SCAN_BUY_LIMIT_OPTIONS = [1, 3, 5, 10]
 DISCORD_BUY_SCORE_THRESHOLD = 70
 DISCORD_COOLDOWN_MINUTES = 30
 JST = ZoneInfo("Asia/Tokyo")
@@ -295,14 +296,39 @@ def _records_from_key(records_key: Tuple[Tuple[str, str, str, str, str, str], ..
     ]
 
 
+def _settings_key(settings: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    return tuple(sorted(settings.items()))
+
+
+def _settings_from_key(settings_key: Tuple[Tuple[str, Any], ...]) -> Dict[str, Any]:
+    return dict(settings_key)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _scan_cached(
     records_key: Tuple[Tuple[str, str, str, str, str, str], ...],
     period: str,
     refresh_token: int,
+    settings_key: Tuple[Tuple[str, Any], ...],
 ) -> List[Dict[str, Any]]:
     del refresh_token
-    return scan_watchlist(_records_from_key(records_key), period=period)
+    settings = _settings_from_key(settings_key)
+    return scan_watchlist(
+        _records_from_key(records_key),
+        period=period,
+        use_daily_top_n=bool(settings.get("use_daily_top_n", True)),
+        daily_top_n=int(settings.get("daily_top_n", 10)),
+        min_daily_score=int(settings.get("min_daily_score", 70)),
+        daily_min_ok=int(settings.get("daily_min_ok", 3)),
+        intraday_min_ok=int(settings.get("intraday_min_ok", 2)),
+        use_vwap=bool(settings.get("use_vwap", True)),
+        use_volume_spike=bool(settings.get("use_volume_spike", True)),
+        use_risk_filter=bool(settings.get("use_risk_filter", True)),
+        max_stop_loss_pct=float(settings.get("max_stop_loss_pct", 3.0)),
+        max_loss_yen_limit=float(settings.get("max_loss_yen_limit", 20000.0)),
+        min_risk_reward=float(settings.get("min_risk_reward", 1.2)),
+        max_buy_candidates=int(settings.get("max_buy_candidates", 1)),
+    )
 
 
 def _score(signal: Dict[str, Any]) -> int:
@@ -312,10 +338,10 @@ def _score(signal: Dict[str, Any]) -> int:
         return 0
 
 
-def _run_stock_scan(watchlist: pd.DataFrame, period: str) -> List[Dict[str, Any]]:
+def _run_stock_scan(watchlist: pd.DataFrame, period: str, settings: Dict[str, Any]) -> List[Dict[str, Any]]:
     scan_start = now_jst_display()
     started = time.perf_counter()
-    signals = _scan_cached(_records_key(watchlist), period, st.session_state.get("refresh_token", 0))
+    signals = _scan_cached(_records_key(watchlist), period, st.session_state.get("refresh_token", 0), _settings_key(settings))
     elapsed = round(time.perf_counter() - started, 2)
     failed_count = sum(1 for signal in signals if signal.get("category") == "取得失敗")
     daily_top_n_pass_count = sum(1 for signal in signals if signal.get("daily_top_n_pass"))
@@ -327,6 +353,7 @@ def _run_stock_scan(watchlist: pd.DataFrame, period: str) -> List[Dict[str, Any]
         "signals_count": len(signals),
         "failed_count": failed_count,
         "daily_top_n_pass_count": daily_top_n_pass_count,
+        "settings": dict(settings),
     }
     return signals
 
@@ -343,6 +370,70 @@ def _render_scan_status() -> None:
     cols[3].metric("elapsed", f"{status.get('elapsed_seconds', '-')}秒")
     cols[4].metric("scan_start_jst", status.get("scan_start_jst", "-"))
     cols[5].metric("scan_end_jst", status.get("scan_end_jst", "-"))
+
+
+def _condition_settings_rows(settings: Dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"条件": "日足上位N", "設定": "ON" if settings.get("use_daily_top_n") else "OFF"},
+            {"条件": "日足スコア上位N", "設定": settings.get("daily_top_n", "-")},
+            {"条件": "日足最低スコア", "設定": settings.get("min_daily_score", "-")},
+            {"条件": "日足OK最低", "設定": f"{settings.get('daily_min_ok', '-')}/4"},
+            {"条件": "5分足OK最低", "設定": f"{settings.get('intraday_min_ok', '-')}/4"},
+            {"条件": "VWAP", "設定": "使用" if settings.get("use_vwap") else "未使用"},
+            {"条件": "出来高急増", "設定": "使用" if settings.get("use_volume_spike") else "未使用"},
+            {"条件": "リスク条件", "設定": "ON" if settings.get("use_risk_filter") else "OFF"},
+            {"条件": "最大損切り幅", "設定": f"{float(settings.get('max_stop_loss_pct', 0)):.1f}%"},
+            {"条件": "最大損失", "設定": f"{float(settings.get('max_loss_yen_limit', 0)):,.0f}円"},
+            {"条件": "最低損益比", "設定": f"{float(settings.get('min_risk_reward', 0)):.2f}"},
+            {"条件": "1回の最大買い候補", "設定": f"{settings.get('max_buy_candidates', '-')}件"},
+        ]
+    )
+
+
+def _render_condition_settings_summary(title: str, settings: Dict[str, Any]) -> None:
+    st.markdown(f"**{title}**")
+    st.dataframe(_safe_dataframe(_condition_settings_rows(settings)), width="stretch", hide_index=True)
+
+
+def _render_normal_scan_settings() -> Dict[str, Any]:
+    with st.expander("通常スキャン条件", expanded=False):
+        st.caption("過去リプレイ検証と同じ意味の条件です。保存機能はまだなく、この画面を開いている間はsession_stateで保持します。")
+        cols = st.columns(4)
+        use_daily_top_n = cols[0].toggle("日足スコア上位Nを使う", value=True, key="normal_scan_use_daily_top_n")
+        daily_top_n = int(cols[1].selectbox("日足スコア上位N", DAILY_TOP_N_OPTIONS, index=1, key="normal_scan_daily_top_n"))
+        min_daily_score = int(cols[2].number_input("日足最低スコア", min_value=0, max_value=100, value=70, step=1, key="normal_scan_min_daily_score"))
+        max_buy_candidates = int(cols[3].selectbox("1回の最大買い候補件数", NORMAL_SCAN_BUY_LIMIT_OPTIONS, index=0, key="normal_scan_max_buy_candidates"))
+
+        cols = st.columns(4)
+        daily_min_ok = int(cols[0].selectbox("日足OK最低数", [2, 3, 4], index=1, key="normal_scan_daily_min_ok"))
+        intraday_min_ok = int(cols[1].selectbox("5分足OK最低数", [2, 3, 4], index=0, key="normal_scan_intraday_min_ok"))
+        use_vwap = cols[2].toggle("VWAP条件を使う", value=True, key="normal_scan_use_vwap")
+        use_volume_spike = cols[3].toggle("出来高急増条件を使う", value=True, key="normal_scan_use_volume_spike")
+
+        cols = st.columns(4)
+        use_risk_filter = cols[0].toggle("リスク条件ON/OFF", value=True, key="normal_scan_use_risk_filter")
+        max_stop_loss_pct = float(cols[1].number_input("最大損切り幅 %", min_value=0.1, max_value=20.0, value=3.0, step=0.1, key="normal_scan_max_stop_loss_pct"))
+        max_loss_yen_limit = float(cols[2].number_input("最大想定損失 円", min_value=1000, max_value=500000, value=20000, step=1000, key="normal_scan_max_loss_yen_limit"))
+        min_risk_reward = float(cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="normal_scan_min_risk_reward"))
+
+    settings = {
+        "use_daily_top_n": bool(use_daily_top_n),
+        "daily_top_n": int(daily_top_n),
+        "min_daily_score": int(min_daily_score),
+        "daily_min_ok": int(daily_min_ok),
+        "intraday_min_ok": int(intraday_min_ok),
+        "use_vwap": bool(use_vwap),
+        "use_volume_spike": bool(use_volume_spike),
+        "use_risk_filter": bool(use_risk_filter),
+        "max_stop_loss_pct": float(max_stop_loss_pct),
+        "max_loss_yen_limit": float(max_loss_yen_limit),
+        "min_risk_reward": float(min_risk_reward),
+        "max_buy_candidates": int(max_buy_candidates),
+    }
+    st.session_state["current_buy_condition_settings"] = settings
+    _render_condition_settings_summary("現在の通常スキャン条件", settings)
+    return settings
 
 
 def _split_signals(signals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], ...]:
@@ -849,7 +940,8 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     daily_df, daily_ok = _daily_condition_rows(signal)
     intraday_df, intraday_ok = _intraday_condition_rows(signal)
     risk_df, risk_ok = _risk_condition_rows(signal)
-    metric_cols = st.columns(5)
+    condition = signal.get("buy_condition_json") if isinstance(signal.get("buy_condition_json"), dict) else {}
+    metric_cols = st.columns(7)
     metric_cols[0].metric(
         "日足",
         f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
@@ -860,7 +952,11 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     )
     metric_cols[2].metric("日足順位", f"{signal.get('daily_rank_at_scan', '-')}/{signal.get('daily_rank_total', '-')}")
     metric_cols[3].metric("日足スコア", _format_score_value(signal.get("daily_score")))
-    metric_cols[4].metric("統合判定", signal.get("category") or signal.get("judgement", "-"))
+    metric_cols[4].metric("上位N", _display_risk_pass(signal.get("daily_top_n_pass", condition.get("daily_top_n_pass"))))
+    metric_cols[5].metric("最小スコア", _display_risk_pass(condition.get("min_score_pass")))
+    metric_cols[6].metric("買い上限", _display_risk_pass(condition.get("max_buy_candidates_pass")))
+    st.caption(f"統合判定: {signal.get('category') or signal.get('judgement', '-')}")
+    st.caption(_buy_condition_text(signal))
     cols = st.columns(3)
     with cols[0]:
         st.caption("日足フィルター")
@@ -1846,8 +1942,8 @@ def _render_last_ai_virtual_run() -> None:
     if not run_state:
         return
 
-    st.markdown("**直近のAI仮想判断実行結果**")
-    event_label = run_state.get("event_label", "フォーム送信を検知しました")
+    st.markdown("**直近のフォワード検証ログ保存結果**")
+    event_label = run_state.get("event_label", "フォワード検証ログ保存を検知しました")
     st.info(f"{event_label}（{run_state.get('timestamp', '-')}）")
     st.write(f"候補数: {run_state.get('candidate_count', 0)}")
     st.write(f"DBパス: {run_state.get('db_path', VIRTUAL_TRADES_DB_PATH)}")
@@ -1876,7 +1972,7 @@ def _render_last_ai_virtual_run() -> None:
         st.warning("process_virtual_trade_signals の戻り値は空です。")
 
     recent_records = st.session_state.get("last_ai_virtual_recent", [])
-    st.markdown("**保存後に再取得した最近のAI仮想取引ログ**")
+    st.markdown("**保存後に再取得した最近のフォワード検証ログ**")
     if recent_records:
         st.dataframe(_safe_dataframe(pd.DataFrame(recent_records)), width="stretch", hide_index=True)
     else:
@@ -2084,7 +2180,7 @@ def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = 
             "db_path": str(VIRTUAL_TRADES_DB_PATH),
             "openai_api_enabled": use_openai,
             "ai_virtual_mode": _openai_mode_label(),
-            "event_label": "AI仮想判断コールバックを検知しました",
+            "event_label": "フォワード検証ログ保存コールバックを検知しました",
             "reason_summary": [result.get("reason", "") for result in results],
             "error": "",
         }
@@ -2103,9 +2199,9 @@ def _on_ai_virtual_run_click(candidates_snapshot: List[Dict[str, Any]] | None = 
             "db_path": str(VIRTUAL_TRADES_DB_PATH),
             "openai_api_enabled": use_openai,
             "ai_virtual_mode": _openai_mode_label(),
-            "event_label": "AI仮想判断コールバックを検知しました",
+            "event_label": "フォワード検証ログ保存コールバックを検知しました",
             "reason_summary": [],
-            "error": f"AI仮想判断中に例外が発生しました: {exc.__class__.__name__}: {exc}",
+            "error": f"フォワード検証ログ保存中に例外が発生しました: {exc.__class__.__name__}: {exc}",
         }
         st.session_state["ai_virtual_last_error"] = f"{exc.__class__.__name__}: {exc}"
 
@@ -2466,28 +2562,28 @@ def _render_manual_virtual_judgement(
     watch: List[Dict[str, Any]],
     has_signals: bool,
 ) -> None:
-    with st.expander("手動の仮想判断", expanded=False):
+    with st.expander("手動のフォワード検証ログ保存", expanded=False):
         if not has_signals:
             st.info("まだスキャン結果がありません。先に『株価スキャンを実行』を押してください。")
-        include_watch = st.checkbox("監視銘柄もAI仮想判断に含める", value=False, disabled=not has_signals)
-        max_candidates = st.selectbox("AI仮想判断する件数", [1, 3, 5, 10], index=1, disabled=not has_signals)
+        include_watch = st.checkbox("監視銘柄もフォワード検証に含める", value=False, disabled=not has_signals)
+        max_candidates = st.selectbox("保存する候補件数", [1, 3, 5, 10], index=1, disabled=not has_signals)
         selected = list(buy) + (list(watch) if include_watch else [])
         selected = sorted(selected, key=lambda item: _score(item), reverse=True)[: int(max_candidates)]
         candidates_snapshot = _snapshot_ai_virtual_candidates(selected)
         st.session_state["ai_virtual_candidates_snapshot"] = candidates_snapshot
 
         if selected:
-            st.caption("今回の仮想判断候補")
+            st.caption("今回のフォワード検証候補")
             st.dataframe(_safe_dataframe(_ai_candidate_table(selected)), width="stretch", hide_index=True)
         elif has_signals:
-            st.info("AI仮想判断できる候補がありません。")
+            st.info("フォワード検証ログとして保存できる候補がありません。")
 
         if not _openai_api_enabled():
             st.caption("手動実行モード：rule_based_fallback（GPT判断なし）")
         else:
             st.caption("OpenAI API使用ONのため、手動実行ではGPT判定を使います。")
         st.button(
-            "AI仮想判断を実行",
+            "フォワード検証ログを保存",
             key="run_ai_virtual_trade_callback_button",
             type="primary",
             disabled=(not has_signals or not candidates_snapshot),
@@ -2560,12 +2656,20 @@ def _render_ai_virtual_trade_tab(
     buy: List[Dict[str, Any]],
     watch: List[Dict[str, Any]],
 ) -> None:
-    st.subheader("AI仮想取引")
-    st.caption("GPTによるpaper trading / virtual trading専用です。実売買・発注・自動売買は行いません。")
+    st.subheader("フォワード検証")
+    st.caption(
+        "フォワード検証は、通常スキャンで出た買い候補を実際の運用時間中に仮想ログとして保存し、"
+        "後日結果を確認するための機能です。実売買・発注・自動売買は行いません。"
+        "OpenAI APIをOFFにしている場合は、GPT判断ではなくルールベースで保存します。"
+    )
 
     trades = _operational_virtual_trades(load_virtual_trades(limit=1000))
     has_signals = bool(st.session_state.get("latest_signals"))
     _render_ai_operation_status(trades)
+    _render_condition_settings_summary(
+        "現在のフォワード検証条件",
+        st.session_state.get("current_buy_condition_settings", {}),
+    )
     _render_manual_virtual_judgement(buy, watch, has_signals)
     _render_rule_auto_logger_section()
     _render_virtual_trade_log_tables(trades)
@@ -2617,6 +2721,12 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
                 "損切り": format_yen(trade.get("stop_loss")),
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("score")),
+                "日足順位": (
+                    f"{trade.get('daily_rank_at_scan')}位/{trade.get('daily_rank_total')}銘柄"
+                    if trade.get("daily_rank_at_scan") not in (None, "")
+                    else "-"
+                ),
+                "日足スコア": _format_score_value(trade.get("daily_score")),
                 "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
                 "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
                 "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
@@ -2626,6 +2736,7 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
                 "損益比": _format_profit_loss_ratio(trade.get("risk_reward_ratio")),
                 "リスク判定": _display_risk_pass(trade.get("risk_pass")),
                 "リスク除外理由": _risk_reason_text(trade),
+                "買い条件": _buy_condition_text(trade),
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -2650,6 +2761,8 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             "損切り",
             "利確目標",
             "スコア",
+            "日足順位",
+            "日足スコア",
             "日足OK",
             "5分足OK",
             "マルチ通過",
@@ -2659,6 +2772,7 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             "損益比",
             "リスク判定",
             "リスク除外理由",
+            "買い条件",
             "結果",
             "終了時刻",
             "終了価格",
@@ -3046,6 +3160,15 @@ def _display_risk_pass(value: Any) -> str:
     return "OK" if bool(value) else "NG"
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _risk_reason_text(trade: Dict[str, Any]) -> str:
     reasons = trade.get("risk_reasons")
     if isinstance(reasons, list) and reasons:
@@ -3068,8 +3191,15 @@ def _buy_condition_text(item: Dict[str, Any]) -> str:
     intraday_ok = item.get("intraday_ok_count", condition.get("intraday_ok_count", "-"))
     intraday_total_count = item.get("intraday_total_count", condition.get("intraday_total_count", "-"))
     risk_pass = item.get("risk_pass", condition.get("risk_pass"))
+    daily_top_n_pass = item.get("daily_top_n_pass", condition.get("daily_top_n_pass"))
+    min_score_pass = condition.get("min_score_pass")
     top_n = item.get("daily_top_n", condition.get("daily_top_n"))
     min_score = condition.get("min_score")
+    max_buy_candidates = condition.get("max_buy_candidates")
+    max_buy_candidates_pass = condition.get("max_buy_candidates_pass")
+    max_stop_loss_pct = condition.get("max_stop_loss_pct")
+    max_loss_yen_limit = condition.get("max_loss_yen_limit")
+    min_risk_reward = condition.get("min_risk_reward")
     parts = []
     if daily_rank not in (None, ""):
         parts.append(f"日足順位 {daily_rank}位/{daily_total or '-'}銘柄中")
@@ -3078,10 +3208,22 @@ def _buy_condition_text(item: Dict[str, Any]) -> str:
     parts.append(f"日足条件 {daily_ok}/{daily_total_count} OK")
     parts.append(f"5分足条件 {intraday_ok}/{intraday_total_count} OK")
     parts.append(f"リスク条件 {_display_risk_pass(risk_pass)}")
+    parts.append(f"日足上位N通過 {_display_risk_pass(daily_top_n_pass)}")
     if min_score not in (None, ""):
-        parts.append(f"最小スコア {min_score}以上")
+        parts.append(f"最小スコア {min_score}以上 {_display_risk_pass(min_score_pass)}")
     if top_n not in (None, ""):
         parts.append(f"日足上位N {top_n}以内")
+    if max_buy_candidates not in (None, ""):
+        parts.append(f"買い候補上限 {max_buy_candidates}件 {_display_risk_pass(max_buy_candidates_pass)}")
+    parsed_max_stop = _optional_float(max_stop_loss_pct)
+    parsed_max_loss = _optional_float(max_loss_yen_limit)
+    parsed_min_rr = _optional_float(min_risk_reward)
+    if parsed_max_stop is not None:
+        parts.append(f"最大損切り幅 {parsed_max_stop:.1f}%以内")
+    if parsed_max_loss is not None:
+        parts.append(f"最大損失 {parsed_max_loss:,.0f}円以内")
+    if parsed_min_rr is not None:
+        parts.append(f"最低損益比 {parsed_min_rr:.2f}以上")
     return " / ".join(parts)
 
 
@@ -3284,6 +3426,14 @@ def _render_historical_scan_overall_summary(result: Dict[str, Any]) -> None:
     cols[2].metric("日足最低点", summary.get("min_daily_score", "-"))
     cols[3].metric("watchlist上限", summary.get("watchlist_limit", "-"))
 
+    cols = st.columns(6)
+    cols[0].metric("データ取得秒数", f"{summary.get('fetch_seconds', 0)}秒")
+    cols[1].metric("特徴量計算秒数", f"{summary.get('feature_seconds', 0)}秒")
+    cols[2].metric("スキャン判定秒数", f"{summary.get('scan_seconds', 0)}秒")
+    cols[3].metric("DB保存秒数", f"{summary.get('db_save_seconds', 0)}秒")
+    cols[4].metric("合計秒数", f"{summary.get('total_seconds', 0)}秒")
+    cols[5].metric("1スキャン平均", f"{summary.get('avg_seconds_per_scan', 0)}秒")
+
     _render_replay_money_summary(result.get("money_summary", {}))
 
 
@@ -3342,6 +3492,90 @@ def _render_watchlist_filter_status(filter_result: Dict[str, Any], target_record
         st.caption("除外: " + ", ".join(str(item) for item in excluded_labels))
     if missing_symbols:
         st.warning("watchlistに存在しない入力銘柄: " + ", ".join(str(item) for item in missing_symbols))
+
+
+def _historical_scan_compare_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    summary = result.get("summary", {}) if isinstance(result, dict) else {}
+    money = result.get("money_summary", {}) if isinstance(result, dict) else {}
+    return {
+        "symbols_count": summary.get("symbols_count", 0),
+        "fetch_success_count": summary.get("fetch_success_count", 0),
+        "fetch_failed_count": summary.get("fetch_failed_count", 0),
+        "scan_steps": summary.get("total_scan_steps", 0),
+        "trades": summary.get("total_trades", 0),
+        "win_rate_pct": summary.get("win_rate_pct", 0),
+        "gross_profit_yen": money.get("gross_profit_yen", 0),
+        "gross_loss_yen": money.get("gross_loss_yen", 0),
+        "net_profit_yen": money.get("net_profit_yen", 0),
+        "profit_loss_ratio": money.get("profit_loss_ratio"),
+        "max_loss_yen": money.get("max_loss_yen"),
+        "avg_loss_yen": money.get("average_loss_yen"),
+        "total_seconds": summary.get("total_seconds", 0),
+    }
+
+
+def _render_historical_scan_ab_comparison(comparison: Dict[str, Any]) -> None:
+    if not comparison:
+        return
+    before = comparison.get("before_exclude", {})
+    after = comparison.get("after_exclude", {})
+    rows = [
+        {
+            "比較": "A: 除外前",
+            "対象銘柄": before.get("symbols_count", 0),
+            "仮想買い": before.get("trades", 0),
+            "勝率": _format_pct_value(before.get("win_rate_pct")),
+            "累計利益": _format_signed_yen(before.get("gross_profit_yen")),
+            "累計損失": _format_signed_yen(before.get("gross_loss_yen")),
+            "純損益": _format_signed_yen(before.get("net_profit_yen")),
+            "損益比": _format_profit_loss_ratio(before.get("profit_loss_ratio")),
+            "最大損失": _format_signed_yen(before.get("max_loss_yen")),
+            "処理秒数": before.get("total_seconds", 0),
+        },
+        {
+            "比較": "B: 除外後",
+            "対象銘柄": after.get("symbols_count", 0),
+            "仮想買い": after.get("trades", 0),
+            "勝率": _format_pct_value(after.get("win_rate_pct")),
+            "累計利益": _format_signed_yen(after.get("gross_profit_yen")),
+            "累計損失": _format_signed_yen(after.get("gross_loss_yen")),
+            "純損益": _format_signed_yen(after.get("net_profit_yen")),
+            "損益比": _format_profit_loss_ratio(after.get("profit_loss_ratio")),
+            "最大損失": _format_signed_yen(after.get("max_loss_yen")),
+            "処理秒数": after.get("total_seconds", 0),
+        },
+    ]
+    before_net = float(before.get("net_profit_yen") or 0)
+    after_net = float(after.get("net_profit_yen") or 0)
+    before_loss = float(before.get("max_loss_yen") or 0)
+    after_loss = float(after.get("max_loss_yen") or 0)
+    diff_net = after_net - before_net
+    diff_loss = after_loss - before_loss
+    rows.append(
+        {
+            "比較": "差分 B-A",
+            "対象銘柄": int(after.get("symbols_count", 0) or 0) - int(before.get("symbols_count", 0) or 0),
+            "仮想買い": int(after.get("trades", 0) or 0) - int(before.get("trades", 0) or 0),
+            "勝率": _format_pct_value(float(after.get("win_rate_pct") or 0) - float(before.get("win_rate_pct") or 0)),
+            "累計利益": _format_signed_yen(float(after.get("gross_profit_yen") or 0) - float(before.get("gross_profit_yen") or 0)),
+            "累計損失": _format_signed_yen(float(after.get("gross_loss_yen") or 0) - float(before.get("gross_loss_yen") or 0)),
+            "純損益": _format_signed_yen(diff_net),
+            "損益比": "-",
+            "最大損失": _format_signed_yen(diff_loss),
+            "処理秒数": "-",
+        }
+    )
+    st.markdown("**除外前 / 除外後 比較**")
+    st.caption("Aは対象銘柄指定だけを適用した結果、Bは対象銘柄指定に加えて除外銘柄も適用した結果です。A側はDBへ保存しません。")
+    st.dataframe(_safe_dataframe(pd.DataFrame(rows)), width="stretch", hide_index=True)
+    if diff_net > 0 and after_loss >= before_loss:
+        st.success("簡易判定: 除外後のほうが純損益は改善しています。最大損失の変化もあわせて確認してください。")
+    elif diff_net > 0:
+        st.info("簡易判定: 純損益は改善していますが、最大損失が悪化していないか確認してください。")
+    elif diff_net < 0:
+        st.warning("簡易判定: 除外後は純損益が悪化しています。除外条件を見直す候補です。")
+    else:
+        st.info("簡易判定: 純損益は同水準です。勝率、損益比、最大損失で比較してください。")
 
 
 def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
@@ -3427,15 +3661,28 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     )
     include_symbols = parse_symbol_input(include_symbols_text)
     exclude_symbols = parse_symbol_input(exclude_symbols_text)
+    compare_exclude_mode = st.toggle(
+        "除外前/除外後を比較する",
+        value=False,
+        key="historical_scan_compare_exclude_mode",
+        help="A=対象銘柄指定だけ、B=対象銘柄指定+除外銘柄で同じ条件を実行して比較します。A側はDB保存しません。",
+    )
+    baseline_filter_result = filter_watchlist_symbols(watchlist, include_symbols=include_symbols, exclude_symbols=[])
     filter_result = filter_watchlist_symbols(watchlist, include_symbols=include_symbols, exclude_symbols=exclude_symbols)
+    baseline_watchlist = baseline_filter_result.get("filtered_watchlist", pd.DataFrame())
     filtered_watchlist = filter_result.get("filtered_watchlist", pd.DataFrame())
     max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
     if max_symbols is None:
+        baseline_limited_watchlist = baseline_watchlist
         limited_watchlist = filtered_watchlist
     else:
+        baseline_limited_watchlist = baseline_watchlist.head(int(max_symbols))
         limited_watchlist = filtered_watchlist.head(int(max_symbols))
+    baseline_target_records = baseline_limited_watchlist.to_dict("records")
     target_records = limited_watchlist.to_dict("records")
     _render_watchlist_filter_status(filter_result, len(target_records))
+    if compare_exclude_mode:
+        st.caption(f"比較A（除外前）: {len(baseline_target_records)}銘柄 / 比較B（除外後）: {len(target_records)}銘柄")
     if int(filter_result.get("final_count", 0)) <= 0:
         st.error("対象銘柄が0件です。対象銘柄のみ/除外銘柄の入力を確認してください。")
     elif len(target_records) < int(filter_result.get("final_count", 0)):
@@ -3454,7 +3701,19 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         progress_bar = st.progress(0)
         status_box = st.empty()
 
+        progress_state = {"last_update": 0.0, "stage": ""}
+
         def _progress(stage: str, current: int, total: int, label: str) -> None:
+            now_perf = time.perf_counter()
+            should_update = (
+                stage != progress_state["stage"]
+                or current >= total
+                or now_perf - progress_state["last_update"] >= 0.3
+            )
+            if not should_update:
+                return
+            progress_state["stage"] = stage
+            progress_state["last_update"] = now_perf
             pct = int(min(100, max(0, current / max(1, total) * 100)))
             progress_bar.progress(pct)
             status_box.info(f"{stage} {current}/{total} {label}")
@@ -3487,7 +3746,18 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 daily_top_n=int(daily_top_n),
                 min_daily_score=int(min_daily_score),
             )
+            ab_comparison = {}
+            if compare_exclude_mode and baseline_target_records:
+                status_box.info("比較A（除外前）を実行しています。A側はDB保存しません。")
+                before_result = run_historical_scan_replay(baseline_target_records, config, progress_callback=_progress)
+                ab_comparison["before_exclude"] = _historical_scan_compare_payload(before_result)
+                progress_state["stage"] = ""
+                progress_state["last_update"] = 0.0
+                status_box.info("比較B（除外後）を実行しています。")
             result = run_historical_scan_replay(target_records, config, progress_callback=_progress)
+            if ab_comparison:
+                ab_comparison["after_exclude"] = _historical_scan_compare_payload(result)
+                result["ab_comparison"] = ab_comparison
             watchlist_filter_summary = {
                 "include_symbols_text": include_symbols_text,
                 "exclude_symbols_text": exclude_symbols_text,
@@ -3500,6 +3770,8 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 "included_count": filter_result.get("included_count", 0),
                 "final_symbols_count": filter_result.get("final_count", 0),
                 "target_records_count": len(target_records),
+                "compare_exclude_mode": bool(compare_exclude_mode),
+                "baseline_target_records_count": len(baseline_target_records),
             }
             result["summary"]["watchlist_filter"] = watchlist_filter_summary
             result["summary"]["include_symbols_text"] = include_symbols_text
@@ -3507,9 +3779,16 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
             result["summary"]["final_symbols_count"] = filter_result.get("final_count", 0)
             result["summary"]["target_records_count"] = len(target_records)
             result["summary"]["missing_symbols"] = filter_result.get("missing_symbols", [])
+            db_save_started = time.perf_counter()
             store_result = insert_replay_trades(
                 result["trades"],
                 replay_run_id=result["summary"].get("replay_run_id"),
+            )
+            result["summary"]["db_save_seconds"] = round(time.perf_counter() - db_save_started, 3)
+            result["summary"]["total_seconds"] = round(
+                float(result["summary"].get("total_seconds", 0) or 0)
+                + float(result["summary"].get("db_save_seconds", 0) or 0),
+                3,
             )
             run_record = {
                 **result["summary"],
@@ -3530,6 +3809,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         return
 
     _render_historical_scan_overall_summary(result)
+    _render_historical_scan_ab_comparison(result.get("ab_comparison", {}))
     st.caption(f"DB保存: {store.get('saved_count', 0)}件 / {result.get('lookahead_note', '')}")
 
     trades = result.get("trades", [])
@@ -3749,7 +4029,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
 
 def _render_virtual_performance_tab() -> None:
     st.subheader("仮想成績")
-    st.caption("AI仮想取引の保存結果を後追いで検証します。実売買の履歴とは完全に分離しています。")
+    st.caption("フォワード検証で保存した仮想ログを後追いで検証します。実売買の履歴とは完全に分離しています。")
     if st.button("仮想成績を更新"):
         summary = update_open_virtual_trade_outcomes()
         st.info(f"確認 {summary['checked']}件 / 更新 {summary['updated']}件 / スキップ {summary['skipped']}件")
@@ -3871,7 +4151,7 @@ def main() -> None:
         )
         st.caption(f"OpenAI APIキー: {'あり' if get_setting('OPENAI_API_KEY', '').strip() else 'なし'}")
         st.caption(f"OpenAI API使用: {'ON' if _openai_api_enabled() else 'OFF'}")
-        st.caption(f"現在のAI仮想判断: {_openai_mode_label()}")
+        st.caption(f"現在のフォワード検証判定: {_openai_mode_label()}")
         st.caption(f"openai_call_count: {int(st.session_state.get('openai_call_count', 0))}")
         if "refresh_token" not in st.session_state:
             st.session_state.refresh_token = 0
@@ -3880,16 +4160,16 @@ def main() -> None:
             st.cache_data.clear()
         st.divider()
         st.button(
-            "AI DB疎通テスト",
+            "フォワード検証DB疎通テスト",
             key="sidebar_ai_virtual_db_test_button",
             on_click=_on_ai_virtual_db_test_click,
         )
         if st.session_state.get("last_ai_virtual_db_test", {}).get("ok"):
             st.caption(
-                f"AI DB OK: trade_id={st.session_state['last_ai_virtual_db_test'].get('trade_id')}"
+                f"フォワード検証DB OK: trade_id={st.session_state['last_ai_virtual_db_test'].get('trade_id')}"
             )
         elif st.session_state.get("last_ai_virtual_db_test"):
-            st.caption("AI DBテスト失敗")
+            st.caption("フォワード検証DBテスト失敗")
 
     try:
         watchlist = load_watchlist()
@@ -3902,10 +4182,11 @@ def main() -> None:
         st.warning(watchlist_error)
 
     st.info("初期表示ではOpenAI APIも株価スキャンも実行しません。スキャンは下のボタンを押した時だけ実行します。")
+    normal_scan_settings = _render_normal_scan_settings()
     scan_cols = st.columns([1, 3])
     if scan_cols[0].button("株価スキャンを実行", key="run_stock_scan_button", type="primary"):
         with st.spinner("株価取得とスコア計算を実行中です..."):
-            _run_stock_scan(watchlist, period)
+            _run_stock_scan(watchlist, period, normal_scan_settings)
     scan_cols[1].caption(f"初期表示直後の openai_call_count は 0 です。現在: {int(st.session_state.get('openai_call_count', 0))}")
     _render_scan_status()
 
@@ -3940,7 +4221,7 @@ def main() -> None:
             "監視",
             "触らない",
             "場中エントリー監視",
-            "AI仮想取引",
+            "フォワード検証",
             "過去リプレイ検証",
             "仮想成績",
             "銘柄別クセ",

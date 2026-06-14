@@ -55,6 +55,12 @@ def rank_daily_candidates(
 
 def build_buy_condition_json(signal: Dict[str, Any], settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
     settings = dict(settings or {})
+    score = signal.get("score", signal.get("intraday_score"))
+    min_score = settings.get("min_score")
+    try:
+        min_score_pass = bool(float(score or 0) >= float(min_score or 0))
+    except (TypeError, ValueError):
+        min_score_pass = False
     daily_total = signal.get("daily_total_count", (signal.get("daily_filter") or {}).get("daily_total_count", "-"))
     intraday_total = signal.get("intraday_total_count", (signal.get("intraday_entry") or {}).get("intraday_total_count", "-"))
     return {
@@ -66,14 +72,23 @@ def build_buy_condition_json(signal: Dict[str, Any], settings: Dict[str, Any] | 
         "intraday_ok_count": signal.get("intraday_ok_count"),
         "intraday_total_count": intraday_total,
         "risk_pass": signal.get("risk_pass"),
-        "min_score": settings.get("min_score"),
+        "score": score,
+        "min_score": min_score,
+        "min_score_pass": min_score_pass,
         "use_daily_top_n": settings.get("use_daily_top_n"),
         "daily_top_n": settings.get("daily_top_n", signal.get("daily_top_n")),
         "min_daily_score": settings.get("min_daily_score"),
         "daily_top_n_pass": signal.get("daily_top_n_pass"),
+        "daily_min_ok": settings.get("daily_min_ok"),
+        "intraday_min_ok": settings.get("intraday_min_ok"),
+        "use_vwap": settings.get("use_vwap"),
+        "use_volume_spike": settings.get("use_volume_spike"),
+        "use_risk_filter": settings.get("use_risk_filter"),
         "max_stop_loss_pct": settings.get("max_stop_loss_pct"),
         "max_loss_yen_limit": settings.get("max_loss_yen_limit"),
         "min_risk_reward": settings.get("min_risk_reward"),
+        "max_buy_candidates": settings.get("max_buy_candidates"),
+        "max_buy_candidates_pass": settings.get("max_buy_candidates_pass"),
         "daily_filter": signal.get("daily_filter") or signal.get("daily_filter_json") or {},
         "intraday_entry": signal.get("intraday_entry") or signal.get("intraday_entry_json") or {},
         "risk_filter": signal.get("risk_filter") or signal.get("risk_filter_json") or {},

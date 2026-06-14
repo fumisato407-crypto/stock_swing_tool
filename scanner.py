@@ -78,13 +78,43 @@ def _apply_multi_timeframe_result(
     intraday_df: pd.DataFrame,
     intraday_error_type: str = "",
     intraday_error_message: str = "",
+    daily_min_ok: int = 3,
+    intraday_min_ok: int = 2,
+    use_vwap: bool = True,
+    use_volume_spike: bool = True,
+    use_risk_filter: bool = True,
+    max_stop_loss_pct: float = 3.0,
+    max_loss_yen_limit: float = 20000.0,
+    min_risk_reward: float = 1.2,
+    use_daily_top_n: bool = True,
+    daily_top_n: int = DEFAULT_DAILY_TOP_N,
+    min_daily_score: int = DEFAULT_MIN_DAILY_SCORE,
+    max_buy_candidates: int = 1,
 ) -> Dict[str, Any]:
-    mtf = evaluate_multi_timeframe_signal(daily_df, intraday_df)
+    mtf = evaluate_multi_timeframe_signal(
+        daily_df,
+        intraday_df,
+        config={
+            "daily_min_ok": daily_min_ok,
+            "intraday_min_ok": intraday_min_ok,
+            "use_vwap": use_vwap,
+            "use_volume_spike": use_volume_spike,
+        },
+    )
     decision = str(mtf.get("decision_category", "avoid"))
     daily_filter = mtf.get("daily_filter", {})
     intraday_entry = mtf.get("intraday_entry", {})
     base_score = int(signal.get("score", 0) or 0)
-    risk_filter = evaluate_risk_filter(signal, shares=100)
+    risk_filter = evaluate_risk_filter(
+        signal,
+        shares=100,
+        config={
+            "enabled": use_risk_filter,
+            "max_stop_loss_pct": max_stop_loss_pct,
+            "max_loss_yen_limit": max_loss_yen_limit,
+            "min_risk_reward": min_risk_reward,
+        },
+    )
     risk_pass = bool(risk_filter.get("risk_pass"))
 
     if decision == "buy" and risk_pass:
@@ -156,13 +186,19 @@ def _apply_multi_timeframe_result(
     updated["buy_condition_json"] = build_buy_condition_json(
         updated,
         {
-            "use_daily_top_n": True,
-            "daily_top_n": updated.get("daily_top_n", DEFAULT_DAILY_TOP_N),
-            "min_daily_score": DEFAULT_MIN_DAILY_SCORE,
+            "use_daily_top_n": use_daily_top_n,
+            "daily_top_n": updated.get("daily_top_n", daily_top_n),
+            "min_daily_score": min_daily_score,
             "min_score": BUY_SCORE_THRESHOLD,
+            "daily_min_ok": daily_min_ok,
+            "intraday_min_ok": intraday_min_ok,
+            "use_vwap": use_vwap,
+            "use_volume_spike": use_volume_spike,
+            "use_risk_filter": use_risk_filter,
             "max_stop_loss_pct": risk_filter.get("max_stop_loss_pct"),
             "max_loss_yen_limit": risk_filter.get("max_loss_yen_limit"),
             "min_risk_reward": risk_filter.get("min_risk_reward"),
+            "max_buy_candidates": max_buy_candidates,
         },
     )
     updated["score_breakdown"] = dict(updated.get("score_breakdown") or {})
@@ -225,12 +261,49 @@ def load_watchlist(path: Path = WATCHLIST_PATH) -> pd.DataFrame:
     return result
 
 
+def apply_max_buy_candidate_limit(
+    signals: List[Dict[str, Any]],
+    max_buy_candidates: int = 1,
+) -> List[Dict[str, Any]]:
+    sorted_signals = sorted([dict(signal) for signal in signals], key=lambda item: item.get("score", -1), reverse=True)
+    buy_seen = 0
+    limit = max(0, int(max_buy_candidates or 0))
+    for signal in sorted_signals:
+        if signal.get("category") != "買い候補":
+            continue
+        buy_seen += 1
+        condition = signal.get("buy_condition_json") if isinstance(signal.get("buy_condition_json"), dict) else {}
+        condition = dict(condition)
+        condition["max_buy_candidates"] = limit
+        if buy_seen <= limit:
+            condition["max_buy_candidates_pass"] = True
+            signal["buy_condition_json"] = condition
+            continue
+        signal["category"] = "監視"
+        signal["score"] = min(BUY_SCORE_THRESHOLD - 1, int(signal.get("score", 0) or 0))
+        signal["entry_type"] = "買い候補上限外"
+        signal["wait_condition"] = "次回スキャンで上位買い候補入り待ち"
+        signal["monitoring_reason"] = f"1回の最大買い候補件数 {limit}件を超過"
+        condition["max_buy_candidates_pass"] = False
+        signal["buy_condition_json"] = condition
+    return sorted_signals
+
+
 def scan_watchlist(
     records: Iterable[Dict[str, Any]],
     period: str = "6mo",
     use_daily_top_n: bool = True,
     daily_top_n: int = DEFAULT_DAILY_TOP_N,
     min_daily_score: int = DEFAULT_MIN_DAILY_SCORE,
+    daily_min_ok: int = 3,
+    intraday_min_ok: int = 2,
+    use_vwap: bool = True,
+    use_volume_spike: bool = True,
+    use_risk_filter: bool = True,
+    max_stop_loss_pct: float = 3.0,
+    max_loss_yen_limit: float = 20000.0,
+    min_risk_reward: float = 1.2,
+    max_buy_candidates: int = 1,
 ) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
     daily_signals: List[Dict[str, Any]] = []
@@ -301,7 +374,15 @@ def scan_watchlist(
         scoring_record["code"] = code
         scoring_record["normalized_symbol"] = fetched.ticker
         signal = score_stock(analyzed, scoring_record)
-        daily_filter = evaluate_daily_filter(analyzed)
+        daily_filter = evaluate_daily_filter(
+            analyzed,
+            config={
+                "daily_min_ok": daily_min_ok,
+                "intraday_min_ok": intraday_min_ok,
+                "use_vwap": use_vwap,
+                "use_volume_spike": use_volume_spike,
+            },
+        )
         signal.update(
             {
                 "daily_filter": daily_filter,
@@ -345,6 +426,15 @@ def scan_watchlist(
                     "daily_top_n": daily_top_n,
                     "min_daily_score": min_daily_score,
                     "min_score": BUY_SCORE_THRESHOLD,
+                    "daily_min_ok": daily_min_ok,
+                    "intraday_min_ok": intraday_min_ok,
+                    "use_vwap": use_vwap,
+                    "use_volume_spike": use_volume_spike,
+                    "use_risk_filter": use_risk_filter,
+                    "max_stop_loss_pct": max_stop_loss_pct,
+                    "max_loss_yen_limit": max_loss_yen_limit,
+                    "min_risk_reward": min_risk_reward,
+                    "max_buy_candidates": max_buy_candidates,
                 },
             )
             signal["comment"] = generate_hyena_comment(signal)
@@ -359,12 +449,24 @@ def scan_watchlist(
             intraday.data if not intraday.error else pd.DataFrame(),
             intraday_error_type=intraday.error_type,
             intraday_error_message=intraday.error_message,
+            daily_min_ok=daily_min_ok,
+            intraday_min_ok=intraday_min_ok,
+            use_vwap=use_vwap,
+            use_volume_spike=use_volume_spike,
+            use_risk_filter=use_risk_filter,
+            max_stop_loss_pct=max_stop_loss_pct,
+            max_loss_yen_limit=max_loss_yen_limit,
+            min_risk_reward=min_risk_reward,
+            use_daily_top_n=use_daily_top_n,
+            daily_top_n=daily_top_n,
+            min_daily_score=min_daily_score,
+            max_buy_candidates=max_buy_candidates,
         )
         signal["comment"] = generate_hyena_comment(signal)
         signal["notification_text"] = build_notification_text(signal)
         signals.append(signal)
 
-    return sorted(signals, key=lambda item: item.get("score", -1), reverse=True)
+    return apply_max_buy_candidate_limit(signals, max_buy_candidates=max_buy_candidates)
 
 
 def build_signal_table(signals: List[Dict[str, Any]]) -> pd.DataFrame:

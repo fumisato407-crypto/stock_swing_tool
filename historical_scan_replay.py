@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -311,7 +312,10 @@ def run_historical_scan_replay(
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
     records = _records_from_watchlist(watchlist_records, config.max_symbols)
+    total_started = time.perf_counter()
+    fetch_started = time.perf_counter()
     data_by_symbol, failures = _fetch_watchlist_data(records, config, progress_callback)
+    fetch_seconds = round(time.perf_counter() - fetch_started, 3)
     scan_times = _build_scan_times(data_by_symbol, config)
     total_scan_steps = len(scan_times)
     trades: List[Dict[str, Any]] = []
@@ -337,6 +341,7 @@ def run_historical_scan_replay(
         min_risk_reward=config.min_risk_reward,
     )
 
+    scan_started = time.perf_counter()
     for step_index, scan_time in enumerate(scan_times, start=1):
         if progress_callback:
             progress_callback("スキャン再現中", step_index, max(1, total_scan_steps), _timestamp_text(scan_time))
@@ -437,14 +442,18 @@ def run_historical_scan_replay(
             )
             trades.append(trade)
             last_signal_by_symbol[symbol] = scan_time
+    scan_seconds = round(time.perf_counter() - scan_started, 3)
 
     if progress_callback:
         progress_callback("結果集計中", 1, 1, "100株想定損益を集計しています")
 
+    summary_started = time.perf_counter()
     trades = apply_replay_money_metrics(trades, config.shares)
     performance = summarize_replay_results(trades)
     money = summarize_replay_money(trades, config.shares)
     symbol_summary = _symbol_trade_summary(trades, data_by_symbol, failures, config.shares)
+    summary_seconds = round(time.perf_counter() - summary_started, 3)
+    total_seconds = round(time.perf_counter() - total_started, 3)
     profit_factor = money.get("profit_loss_ratio")
     replay_run_id = f"watchlist-scan-{now_jst_iso()}"
     summary = {
@@ -494,6 +503,12 @@ def run_historical_scan_replay(
         "total_scan_steps": total_scan_steps,
         "total_candidates": total_candidates,
         "total_trades": len(trades),
+        "fetch_seconds": fetch_seconds,
+        "feature_seconds": 0.0,
+        "scan_seconds": scan_seconds,
+        "summary_seconds": summary_seconds,
+        "total_seconds": total_seconds,
+        "avg_seconds_per_scan": round(scan_seconds / max(1, total_scan_steps), 4),
         "win_rate_pct": performance.get("win_rate_pct", 0),
         "profit_factor": profit_factor,
         "error_count": len(failures),
