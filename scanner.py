@@ -10,8 +10,10 @@ from ai_judge import generate_hyena_comment
 from config import TRADES_PATH, WATCHLIST_PATH
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from indicators import add_indicators
+from intraday_scanner import fetch_intraday_data
+from multi_timeframe_rules import evaluate_multi_timeframe_signal
 from notifier import build_notification_text
-from scoring import score_stock
+from scoring import BUY_SCORE_THRESHOLD, WATCH_SCORE_THRESHOLD, score_stock
 
 
 WATCHLIST_COLUMNS = ["code", "name", "theme", "market", "raw_code", "normalized_symbol"]
@@ -65,6 +67,82 @@ TRADES_COLUMNS = [
     "result_5d",
     "memo",
 ]
+
+
+def _apply_multi_timeframe_result(
+    signal: Dict[str, Any],
+    daily_df: pd.DataFrame,
+    intraday_df: pd.DataFrame,
+    intraday_error_type: str = "",
+    intraday_error_message: str = "",
+) -> Dict[str, Any]:
+    mtf = evaluate_multi_timeframe_signal(daily_df, intraday_df)
+    decision = str(mtf.get("decision_category", "avoid"))
+    daily_filter = mtf.get("daily_filter", {})
+    intraday_entry = mtf.get("intraday_entry", {})
+    base_score = int(signal.get("score", 0) or 0)
+
+    if decision == "buy":
+        category = "買い候補"
+        score = max(BUY_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score))
+        entry_type = str(mtf.get("entry_type") or signal.get("entry_type") or "ブレイク狙い")
+        wait_condition = signal.get("wait_condition", "-")
+        monitoring_reason = f"日足{daily_filter.get('daily_ok_count', 0)}/4 + 5分足{intraday_entry.get('intraday_ok_count', 0)}/4"
+    elif bool(daily_filter.get("daily_pass")):
+        category = "監視"
+        score = min(BUY_SCORE_THRESHOLD - 1, max(WATCH_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score)))
+        entry_type = "5分足エントリー待ち"
+        wait_condition = "VWAP上、直近高値突破、押し目反発、出来高急増の達成待ち"
+        monitoring_reason = f"日足は{daily_filter.get('daily_ok_count', 0)}/4で通過。5分足は{intraday_entry.get('intraday_ok_count', 0)}/4"
+    else:
+        category = "触らない"
+        score = min(WATCH_SCORE_THRESHOLD - 1, int(mtf.get("score", base_score) or base_score))
+        entry_type = "見送り"
+        wait_condition = "日足フィルター未達"
+        monitoring_reason = f"日足フィルター{daily_filter.get('daily_ok_count', 0)}/4で未達"
+
+    updated = dict(signal)
+    updated.update(
+        {
+            "score": score,
+            "category": category,
+            "entry_type": entry_type,
+            "wait_condition": wait_condition,
+            "monitoring_reason": monitoring_reason,
+            "multi_timeframe_enabled": True,
+            "multi_timeframe_pass": bool(mtf.get("multi_timeframe_pass")),
+            "multi_timeframe_score": mtf.get("score"),
+            "multi_timeframe_decision": decision,
+            "daily_filter": daily_filter,
+            "intraday_entry": intraday_entry,
+            "daily_ok_count": daily_filter.get("daily_ok_count", 0),
+            "daily_total_count": daily_filter.get("daily_total_count", 4),
+            "intraday_ok_count": intraday_entry.get("intraday_ok_count", 0),
+            "intraday_total_count": intraday_entry.get("intraday_total_count", 4),
+            "daily_filter_json": daily_filter,
+            "intraday_entry_json": intraday_entry,
+            "multi_timeframe_detail": mtf.get("detail_json", {}),
+            "multi_timeframe_reasons": mtf.get("reasons", []),
+            "intraday_error_type": intraday_error_type,
+            "intraday_error_message": intraday_error_message,
+        }
+    )
+    updated["score_breakdown"] = dict(updated.get("score_breakdown") or {})
+    updated["score_breakdown"]["total_score"] = score
+    positives = list(updated.get("positive_reasons") or [])
+    negatives = list(updated.get("negative_reasons") or [])
+    waits = list(updated.get("wait_reasons") or [])
+    positives.extend([reason for reason in mtf.get("reasons", []) if reason not in positives])
+    if intraday_error_message:
+        waits.append(f"5分足未取得: {intraday_error_message}")
+    if category == "監視":
+        waits.append(wait_condition)
+    if category == "触らない":
+        negatives.append(monitoring_reason)
+    updated["positive_reasons"] = list(dict.fromkeys(positives))
+    updated["negative_reasons"] = list(dict.fromkeys(negatives))
+    updated["wait_reasons"] = list(dict.fromkeys(waits))
+    return updated
 
 
 def load_watchlist(path: Path = WATCHLIST_PATH) -> pd.DataFrame:
@@ -176,6 +254,14 @@ def scan_watchlist(records: Iterable[Dict[str, Any]], period: str = "6mo") -> Li
         scoring_record["code"] = code
         scoring_record["normalized_symbol"] = fetched.ticker
         signal = score_stock(analyzed, scoring_record)
+        intraday = fetch_intraday_data(code, interval="5m", period="5d")
+        signal = _apply_multi_timeframe_result(
+            signal,
+            analyzed,
+            intraday.data if not intraday.error else pd.DataFrame(),
+            intraday_error_type=intraday.error_type,
+            intraday_error_message=intraday.error_message,
+        )
         signal["comment"] = generate_hyena_comment(signal)
         signal["notification_text"] = build_notification_text(signal)
         signal["history"] = analyzed.tail(160)

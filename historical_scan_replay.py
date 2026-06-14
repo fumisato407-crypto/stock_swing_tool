@@ -36,6 +36,12 @@ class HistoricalScanReplayConfig:
     shares: int = 100
     max_symbols: Optional[int] = 30
     source_watchlist: str = "watchlist.csv"
+    use_multi_timeframe: bool = True
+    daily_filter_required: bool = True
+    daily_min_ok: int = 3
+    intraday_min_ok: int = 2
+    use_vwap: bool = True
+    use_volume_spike: bool = True
 
 
 def _timestamp_text(value: Any) -> str:
@@ -142,14 +148,23 @@ def _fetch_watchlist_data(
         fetched = load_or_fetch_historical_data(symbol, config.period, config.interval)
         validation = validate_historical_ohlcv(fetched.data)
         cleaned = validation.get("cleaned_data", pd.DataFrame())
+        daily_cleaned = pd.DataFrame()
+        daily_error = ""
+        if config.use_multi_timeframe:
+            daily_fetched = load_or_fetch_historical_data(symbol, "6mo", "1d")
+            daily_validation = validate_historical_ohlcv(daily_fetched.data)
+            daily_cleaned = daily_validation.get("cleaned_data", pd.DataFrame())
+            daily_error = daily_fetched.error_message or ""
         meta = {
             "symbol": symbol,
             "name": name,
             "fetched_rows": fetched.fetched_rows,
             "cleaned_rows": len(cleaned),
+            "daily_rows": len(daily_cleaned),
             "from_cache": fetched.from_cache,
             "error_type": fetched.error_type,
             "error_message": fetched.error_message,
+            "daily_error": daily_error,
             "excluded_count": validation.get("excluded_count", 0),
             "first_timestamp": fetched.first_timestamp,
             "last_timestamp": fetched.last_timestamp,
@@ -161,6 +176,7 @@ def _fetch_watchlist_data(
             "record": record,
             "name": name,
             "data": cleaned,
+            "daily_data": daily_cleaned,
             "meta": meta,
             "validation": {key: value for key, value in validation.items() if key != "cleaned_data"},
         }
@@ -246,6 +262,11 @@ def run_historical_scan_replay(
         max_trades=config.max_buys_per_scan,
         interval=config.interval,
         debug=True,
+        use_multi_timeframe=config.use_multi_timeframe,
+        daily_min_ok=config.daily_min_ok if config.daily_filter_required else 0,
+        intraday_min_ok=config.intraday_min_ok,
+        use_vwap=config.use_vwap,
+        use_volume_spike=config.use_volume_spike,
     )
 
     for step_index, scan_time in enumerate(scan_times, start=1):
@@ -265,6 +286,7 @@ def run_historical_scan_replay(
                 replay_config,
                 symbol=symbol,
                 name=str(item.get("name", "")),
+                daily_df=item.get("daily_data"),
             )
             if signal.get("replay_skip_reason"):
                 continue
@@ -346,6 +368,11 @@ def run_historical_scan_replay(
         "max_buys_per_scan": config.max_buys_per_scan,
         "cooldown": config.cooldown,
         "shares": config.shares,
+        "use_multi_timeframe": config.use_multi_timeframe,
+        "daily_min_ok": config.daily_min_ok,
+        "intraday_min_ok": config.intraday_min_ok,
+        "use_vwap": config.use_vwap,
+        "use_volume_spike": config.use_volume_spike,
         "total_scan_steps": total_scan_steps,
         "total_candidates": total_candidates,
         "total_trades": len(trades),

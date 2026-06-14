@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from entry_rules import evaluate_intraday_entry
+from multi_timeframe_rules import build_replay_daily_context, evaluate_multi_timeframe_signal
 
 
 INTERVAL_MAX_HOLD_BARS = {
@@ -26,6 +27,11 @@ class ReplayRuleConfig:
     interval: str = "5m"
     cooldown_bars: int = 12
     debug: bool = False
+    use_multi_timeframe: bool = True
+    daily_min_ok: int = 3
+    intraday_min_ok: int = 2
+    use_vwap: bool = True
+    use_volume_spike: bool = True
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -54,6 +60,9 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
     if isinstance(rule_config, ReplayRuleConfig):
         return rule_config
     values = dict(rule_config or {})
+    def _int_setting(key: str, default: int) -> int:
+        return default if values.get(key) is None else int(values.get(key))
+
     return ReplayRuleConfig(
         min_score=int(values.get("min_score", 70) or 70),
         target_rule=str(values.get("target_rule", "すべて") or "すべて"),
@@ -61,7 +70,21 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
         interval=str(values.get("interval", "5m") or "5m"),
         cooldown_bars=int(values.get("cooldown_bars", 12) or 12),
         debug=bool(values.get("debug", False)),
+        use_multi_timeframe=bool(values.get("use_multi_timeframe", True)),
+        daily_min_ok=_int_setting("daily_min_ok", 3),
+        intraday_min_ok=_int_setting("intraday_min_ok", 2),
+        use_vwap=bool(values.get("use_vwap", True)),
+        use_volume_spike=bool(values.get("use_volume_spike", True)),
     )
+
+
+def _multi_timeframe_config(config: ReplayRuleConfig) -> Dict[str, Any]:
+    return {
+        "daily_min_ok": config.daily_min_ok,
+        "intraday_min_ok": config.intraday_min_ok,
+        "use_vwap": config.use_vwap,
+        "use_volume_spike": config.use_volume_spike,
+    }
 
 
 def _max_hold_bars(interval: str) -> int:
@@ -88,6 +111,7 @@ def evaluate_replay_step(
     rule_config: Dict[str, Any] | ReplayRuleConfig,
     symbol: str = "",
     name: str = "",
+    daily_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     config = _normalize_rule_config(rule_config)
     if history_df.empty or len(history_df) < 25:
@@ -104,6 +128,37 @@ def evaluate_replay_step(
         intraday_data=safe_history.tail(160),
         previous_low=_previous_session_low(safe_history, current_ts),
     )
+    if config.use_multi_timeframe:
+        daily_context = build_replay_daily_context(safe_history, current_ts, prior_daily_df=daily_df)
+        mtf = evaluate_multi_timeframe_signal(
+            daily_context,
+            safe_history.tail(160),
+            current_time=current_ts,
+            config=_multi_timeframe_config(config),
+        )
+        decision = str(mtf.get("decision_category", "avoid"))
+        if decision == "buy":
+            signal["judgement"] = "買い検討OK"
+        elif decision == "watch":
+            signal["judgement"] = "監視強化"
+        else:
+            signal["judgement"] = "見送り"
+        signal["intraday_score"] = int(mtf.get("score", signal.get("intraday_score", 0)) or 0)
+        signal["signal_type"] = str(mtf.get("entry_type") or signal.get("signal_type", "見送り"))
+        signal["multi_timeframe_enabled"] = True
+        signal["multi_timeframe_pass"] = bool(mtf.get("multi_timeframe_pass"))
+        signal["multi_timeframe_score"] = mtf.get("score")
+        signal["multi_timeframe_decision"] = decision
+        signal["daily_filter"] = mtf.get("daily_filter", {})
+        signal["intraday_entry"] = mtf.get("intraday_entry", {})
+        signal["daily_ok_count"] = signal["daily_filter"].get("daily_ok_count", 0)
+        signal["daily_total_count"] = signal["daily_filter"].get("daily_total_count", 4)
+        signal["intraday_ok_count"] = signal["intraday_entry"].get("intraday_ok_count", 0)
+        signal["intraday_total_count"] = signal["intraday_entry"].get("intraday_total_count", 4)
+        signal["daily_filter_json"] = signal["daily_filter"]
+        signal["intraday_entry_json"] = signal["intraday_entry"]
+        signal["multi_timeframe_detail"] = mtf.get("detail_json", {})
+        signal["reasons"] = list(dict.fromkeys(list(signal.get("reasons", [])) + list(mtf.get("reasons", []))))
     score = int(signal.get("intraday_score", 0) or 0)
     signal_type = str(signal.get("signal_type", ""))
     if score < config.min_score:
@@ -128,6 +183,13 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "score": int(signal.get("intraday_score", 0) or 0),
         "entry_type": signal.get("signal_type", "-"),
         "rule_name": "intraday_replay_rule",
+        "daily_ok_count": signal.get("daily_ok_count"),
+        "daily_total_count": signal.get("daily_total_count"),
+        "intraday_ok_count": signal.get("intraday_ok_count"),
+        "intraday_total_count": signal.get("intraday_total_count"),
+        "daily_filter_json": signal.get("daily_filter_json", signal.get("daily_filter", {})),
+        "intraday_entry_json": signal.get("intraday_entry_json", signal.get("intraday_entry", {})),
+        "multi_timeframe_pass": signal.get("multi_timeframe_pass"),
         "signal": {
             key: value
             for key, value in signal.items()
@@ -278,6 +340,7 @@ def run_replay(
     end_at: Any = None,
     rule_config: Optional[Dict[str, Any] | ReplayRuleConfig] = None,
     name: str = "",
+    daily_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     config = _normalize_rule_config(rule_config)
     if df is None or df.empty:
@@ -307,7 +370,7 @@ def run_replay(
             continue
 
         history = all_data.loc[all_data.index <= current_time]
-        signal = evaluate_replay_step(history, current_time, config, symbol=symbol, name=name)
+        signal = evaluate_replay_step(history, current_time, config, symbol=symbol, name=name, daily_df=daily_df)
         evaluated_steps += 1
         if signal.get("replay_skip_reason") or signal.get("judgement") not in {"買い検討OK", "監視強化"}:
             continue

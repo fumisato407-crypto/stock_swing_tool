@@ -97,6 +97,9 @@ COMPACT_COLUMNS = [
     "name",
     "price",
     "score",
+    "daily_ok",
+    "intraday_ok",
+    "multi_timeframe",
     "entry_type",
     "expected_value_label",
     "risk_reward",
@@ -338,9 +341,16 @@ def _render_scan_status() -> None:
 def _split_signals(signals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], ...]:
     failed = [s for s in signals if s.get("category") == "取得失敗"]
     analyzable = [s for s in signals if s.get("category") != "取得失敗"]
-    buy = [s for s in analyzable if _score(s) >= BUY_SCORE_THRESHOLD]
-    watch = [s for s in analyzable if WATCH_SCORE_THRESHOLD <= _score(s) < BUY_SCORE_THRESHOLD]
-    avoid = [s for s in analyzable if _score(s) < WATCH_SCORE_THRESHOLD]
+    buy = [s for s in analyzable if s.get("category") == "買い候補" or _score(s) >= BUY_SCORE_THRESHOLD]
+    buy_ids = {id(s) for s in buy}
+    watch = [
+        s
+        for s in analyzable
+        if id(s) not in buy_ids
+        and (s.get("category") == "監視" or WATCH_SCORE_THRESHOLD <= _score(s) < BUY_SCORE_THRESHOLD)
+    ]
+    watch_ids = {id(s) for s in watch}
+    avoid = [s for s in analyzable if id(s) not in buy_ids and id(s) not in watch_ids]
     return buy, watch, avoid, failed
 
 
@@ -458,6 +468,9 @@ def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
                 "name": signal.get("name", ""),
                 "price": format_yen(signal.get("price")),
                 "score": signal.get("score", "-"),
+                "daily_ok": f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
+                "intraday_ok": f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
+                "multi_timeframe": "OK" if signal.get("multi_timeframe_pass") else "NG",
                 "entry_type": signal.get("entry_type", "-"),
                 "expected_value_label": signal.get("expected_value_label", "-"),
                 "risk_reward": _format_rr(signal),
@@ -597,6 +610,279 @@ def _render_count_metrics(
     metric_cols[3].metric("取得失敗", len(failed))
 
 
+def _to_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _condition_status(value: bool | None, unavailable: str = "未使用") -> str:
+    if value is None:
+        return unavailable
+    return "OK" if value else "NG"
+
+
+def _condition_table(rows: List[Dict[str, str]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["条件", "判定", "補足"])
+
+
+def _latest_daily_row(signal: Dict[str, Any]) -> pd.Series | None:
+    history = signal.get("history")
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        return history.iloc[-1]
+    return None
+
+
+def _daily_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool | None]:
+    saved = signal.get("daily_filter") or signal.get("daily_filter_json")
+    if isinstance(saved, dict) and saved:
+        rows = [
+            {
+                "条件": "25日線より上",
+                "判定": _condition_status(bool(saved.get("ma25_ok"))),
+                "補足": f"終値 {format_yen(saved.get('close'))} / 25日線 {format_yen(saved.get('ma25'))}",
+            },
+            {
+                "条件": "前日終値より上",
+                "判定": _condition_status(bool(saved.get("above_prev_close_ok"))),
+                "補足": f"終値 {format_yen(saved.get('close'))} / 前日終値 {format_yen(saved.get('previous_close'))}",
+            },
+            {
+                "条件": "直近5日高値圏",
+                "判定": _condition_status(bool(saved.get("near_5day_high_ok"))),
+                "補足": f"終値 {format_yen(saved.get('close'))} / 5日高値 {format_yen(saved.get('recent_5day_high'))}",
+            },
+            {
+                "条件": "日足出来高増加",
+                "判定": _condition_status(bool(saved.get("daily_volume_increase_ok"))),
+                "補足": f"出来高 {int(_to_float(saved.get('current_volume'), 0) or 0):,} / 5日平均 {int(_to_float(saved.get('avg_volume_5d'), 0) or 0):,}",
+            },
+        ]
+        return _condition_table(rows), bool(saved.get("daily_pass"))
+
+    row = _latest_daily_row(signal)
+    if row is None:
+        rows = [
+            {"条件": "25日線より上", "判定": "未取得", "補足": "日足履歴なし"},
+            {"条件": "前日終値より上", "判定": "未取得", "補足": "日足履歴なし"},
+            {"条件": "直近5日高値圏", "判定": "未取得", "補足": "日足履歴なし"},
+            {"条件": "出来高増加", "判定": "未取得", "補足": "日足履歴なし"},
+        ]
+        return _condition_table(rows), None
+
+    close = _to_float(row.get("Close"))
+    sma_25 = _to_float(row.get("sma_25"))
+    prev_close = _to_float(row.get("prev_close"))
+    recent_5_high = _to_float(row.get("recent_5_high"))
+    volume = _to_float(row.get("Volume"))
+    volume_ma = _to_float(row.get("volume_ma_20"))
+
+    above_25 = close is not None and sma_25 is not None and close > sma_25
+    above_prev_close = close is not None and prev_close is not None and close > prev_close
+    near_5_high = close is not None and recent_5_high is not None and close >= recent_5_high * 0.98
+    volume_increased = volume is not None and volume_ma is not None and volume >= volume_ma
+
+    rows = [
+        {
+            "条件": "25日線より上",
+            "判定": _condition_status(above_25 if close is not None and sma_25 is not None else None, "未取得"),
+            "補足": f"終値 {format_yen(close)} / 25日線 {format_yen(sma_25)}",
+        },
+        {
+            "条件": "前日終値より上",
+            "判定": _condition_status(above_prev_close if close is not None and prev_close is not None else None, "未取得"),
+            "補足": f"終値 {format_yen(close)} / 前日終値 {format_yen(prev_close)}",
+        },
+        {
+            "条件": "直近5日高値圏",
+            "判定": _condition_status(near_5_high if close is not None and recent_5_high is not None else None, "未取得"),
+            "補足": f"終値 {format_yen(close)} / 5日高値 {format_yen(recent_5_high)}",
+        },
+        {
+            "条件": "出来高増加",
+            "判定": _condition_status(volume_increased if volume is not None and volume_ma is not None else None, "未取得"),
+            "補足": f"出来高 {int(volume or 0):,} / 20日平均 {int(volume_ma or 0):,}",
+        },
+    ]
+    daily_ok = _score(signal) >= WATCH_SCORE_THRESHOLD and above_25
+    return _condition_table(rows), bool(daily_ok)
+
+
+def _intraday_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool | None]:
+    saved = signal.get("intraday_entry") or signal.get("intraday_entry_json")
+    if isinstance(saved, dict) and saved:
+        rows = [
+            {
+                "条件": "VWAP上",
+                "判定": _condition_status(bool(saved.get("vwap_ok"))),
+                "補足": f"現在値 {format_yen(saved.get('current_close'))} / VWAP {format_yen(saved.get('vwap'))}",
+            },
+            {
+                "条件": "直近高値突破",
+                "判定": _condition_status(bool(saved.get("breakout_ok"))),
+                "補足": f"過去高値 {format_yen(saved.get('past_n_bars_high'))}",
+            },
+            {
+                "条件": "押し目反発",
+                "判定": _condition_status(bool(saved.get("pullback_rebound_ok"))),
+                "補足": "VWAP付近への押し後に再上抜け",
+            },
+            {
+                "条件": "出来高急増",
+                "判定": _condition_status(bool(saved.get("intraday_volume_spike_ok"))),
+                "補足": f"出来高 {int(_to_float(saved.get('current_volume'), 0) or 0):,} / 平均 {int(_to_float(saved.get('avg_volume_12bars'), 0) or 0):,}",
+            },
+        ]
+        return _condition_table(rows), bool(saved.get("intraday_pass"))
+
+    has_intraday = any(
+        key in signal
+        for key in (
+            "intraday_score",
+            "above_mas",
+            "level_breakout",
+            "level_hold",
+            "higher_low",
+            "volume_ratio",
+        )
+    )
+    if not has_intraday:
+        rows = [
+            {"条件": "VWAP上", "判定": "未使用", "補足": "通常株価スキャンでは5分足を取得しません"},
+            {"条件": "直近高値突破", "判定": "未取得", "補足": "場中監視タブで確認"},
+            {"条件": "押し目反発", "判定": "未取得", "補足": "場中監視タブで確認"},
+            {"条件": "出来高急増", "判定": "未取得", "補足": "場中監視タブで確認"},
+        ]
+        return _condition_table(rows), None
+
+    level_breakout = bool(signal.get("level_breakout") or signal.get("level_hold"))
+    higher_low = bool(signal.get("higher_low"))
+    signal_type = str(signal.get("signal_type", ""))
+    pullback_rebound = higher_low or signal_type in {"押し目再反発", "後場V字回復"}
+    volume_ratio = _to_float(signal.get("volume_ratio"))
+    volume_spike = volume_ratio is not None and volume_ratio >= 1.2
+    above_mas = bool(signal.get("above_mas"))
+    intraday_ok = above_mas and (level_breakout or pullback_rebound) and volume_spike
+
+    rows = [
+        {"条件": "VWAP上", "判定": "未使用", "補足": "現行MVPではVWAPを計算していません"},
+        {
+            "条件": "直近高値突破",
+            "判定": _condition_status(level_breakout),
+            "補足": "節目突破/維持と直近高値圏を代替条件にしています",
+        },
+        {
+            "条件": "押し目反発",
+            "判定": _condition_status(pullback_rebound),
+            "補足": "安値切り上げ、短期線回復、再反発型を確認",
+        },
+        {
+            "条件": "出来高急増",
+            "判定": _condition_status(volume_spike if volume_ratio is not None else None, "未取得"),
+            "補足": f"直近平均比 {volume_ratio:.2f}倍" if volume_ratio is not None else "出来高倍率なし",
+        },
+    ]
+    return _condition_table(rows), bool(intraday_ok)
+
+
+def _combined_judgement_text(daily_ok: bool | None, intraday_ok: bool | None) -> str:
+    if daily_ok is None and intraday_ok is None:
+        return "判定データが不足しています。"
+    if daily_ok is None:
+        return "場中エントリー監視は5分足判定です。日足フィルターは通常株価スキャンとは別判定です。"
+    if intraday_ok is None:
+        return "通常株価スキャンは日足のみです。5分足エントリーは場中エントリー監視タブで別確認です。"
+    if daily_ok and intraday_ok:
+        return "日足OK + 5分足OK = マルチ時間足買い候補"
+    if daily_ok and not intraday_ok:
+        return "日足OK + 5分足NG = 監視"
+    return "日足NG = 除外または触らない"
+
+
+def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
+    st.markdown("**判定内訳**")
+    daily_df, daily_ok = _daily_condition_rows(signal)
+    intraday_df, intraday_ok = _intraday_condition_rows(signal)
+    metric_cols = st.columns(3)
+    metric_cols[0].metric(
+        "日足",
+        f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
+    )
+    metric_cols[1].metric(
+        "5分足",
+        f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
+    )
+    metric_cols[2].metric("統合判定", signal.get("category") or signal.get("judgement", "-"))
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("日足フィルター")
+        st.dataframe(daily_df, width="stretch", hide_index=True)
+    with cols[1]:
+        st.caption("5分足エントリー")
+        st.dataframe(intraday_df, width="stretch", hide_index=True)
+    st.caption(f"判定: {_combined_judgement_text(daily_ok, intraday_ok)}")
+
+
+def _render_logic_confirmation_section() -> None:
+    with st.expander("判定ロジック確認", expanded=False):
+        st.caption("現在の実装が実際に見ている時間足と条件です。ここではロジックを変更せず、確認用に表示しています。")
+
+        st.markdown("**通常株価スキャン**")
+        st.dataframe(
+            _condition_table(
+                [
+                    {"条件": "使用データ", "判定": "日足 + 5分足", "補足": "日足でフィルターし、取得できる場合は当日5分足でエントリー判定"},
+                    {"条件": "25日線", "判定": "使用", "補足": "終値 > 25日線"},
+                    {"条件": "前日終値", "判定": "使用", "補足": "現在の日足終値 > 前日終値"},
+                    {"条件": "直近5日高値", "判定": "使用", "補足": "直近5日高値から2%以内"},
+                    {"条件": "出来高増加", "判定": "使用", "補足": "日足出来高 >= 5日平均の1.2倍"},
+                    {"条件": "VWAP", "判定": "使用", "補足": "当日5分足VWAPを計算"},
+                    {"条件": "5分足直近高値突破", "判定": "使用", "補足": "現在足を除く過去12本高値を突破"},
+                    {"条件": "押し目反発", "判定": "使用", "補足": "VWAP付近への押し後に再上抜け"},
+                    {"条件": "出来高急増", "判定": "使用", "補足": "5分足出来高 >= 過去12本平均の1.5倍"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.markdown("**場中エントリー監視**")
+        st.dataframe(
+            _condition_table(
+                [
+                    {"条件": "使用データ", "判定": "5分足中心", "補足": "yfinance period=5d / interval=5mが基本"},
+                    {"条件": "VWAP", "判定": "未使用", "補足": "場中監視タブ単体の既存ロジックではまだ計算していません"},
+                    {"条件": "移動平均線", "判定": "使用", "補足": "5本、10本、20本の5分足移動平均"},
+                    {"条件": "直近高値突破", "判定": "使用", "補足": "直近12本高値圏、節目突破/維持で判定"},
+                    {"条件": "押し目反発", "判定": "使用", "補足": "安値切り上げ、短期線回復、再反発型"},
+                    {"条件": "出来高急増", "判定": "使用", "補足": "直近平均出来高比1.2倍以上を加点"},
+                    {"条件": "日足フィルター", "判定": "別判定", "補足": "通常株価スキャンとは統合していません"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.markdown("**過去スキャン再現**")
+        st.dataframe(
+            _condition_table(
+                [
+                    {"条件": "使用データ", "判定": "日足 + 選択時間足", "補足": "マルチ時間足ON時は6か月日足と選択足を組み合わせます"},
+                    {"条件": "買い判定", "判定": "未来データ未使用", "補足": "前日までの確定日足 + scan_time以前の足だけで評価"},
+                    {"条件": "結果検証", "判定": "未来データ使用", "補足": "entry後のfuture_dfだけで利確/損切り/期限到達を検証"},
+                    {"条件": "日足+5分足統合", "判定": "使用可能", "補足": "初期値は日足3/4以上 + 5分足2/4以上"},
+                    {"条件": "OpenAI API", "判定": "未使用", "補足": "過去検証はルールベースのみです"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.info("通常株価スキャンと過去検証ではマルチ時間足判定を使えます。場中エントリー監視タブ単体は既存の5分足監視ロジックを維持しています。")
+
+
 def _render_signal_metrics(signal: Dict[str, Any]) -> None:
     cols = st.columns(3)
     cols[0].metric("現在値", format_yen(signal.get("price")))
@@ -628,6 +914,8 @@ def _render_detail_content(signal: Dict[str, Any], key_prefix: str, show_chart: 
     st.markdown(f"<div class='signal-line'><b>利確目安</b>：{_format_targets(signal)}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='signal-line'><b>ハイエナ心理</b>：{signal.get('comment', '-')}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='signal-line'><b>無効条件</b>：{signal.get('invalidation_condition', signal.get('invalid_conditions', '-'))}</div>", unsafe_allow_html=True)
+
+    _render_judgement_breakdown(signal)
 
     st.markdown("**スコア内訳**")
     st.dataframe(_score_breakdown_rows(signal), width="stretch", hide_index=True)
@@ -786,6 +1074,8 @@ def _render_intraday_signal(signal: Dict[str, Any], key_prefix: str) -> None:
         f"安値 {format_yen(signal.get('day_low'))} / 安値から {signal.get('rebound_from_day_low_pct', 0)}%"
     )
     st.markdown(f"**RSI**：{signal.get('rsi', '-')}")
+
+    _render_judgement_breakdown(signal)
 
     _render_reason_list("判定理由", signal.get("reasons"))
     _render_reason_list("見送り・警戒理由", signal.get("risk_notes"))
@@ -2262,6 +2552,9 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
                 "損切り": format_yen(trade.get("stop_loss")),
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("score")),
+                "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
+                "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
+                "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -2286,6 +2579,9 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             "損切り",
             "利確目標",
             "スコア",
+            "日足OK",
+            "5分足OK",
+            "マルチ通過",
             "結果",
             "終了時刻",
             "終了価格",
@@ -2323,6 +2619,9 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "損切り": format_yen(trade.get("stop_loss")),
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("scan_score", trade.get("score"))),
+                "日足OK": f"{trade.get('daily_ok_count', '-')}/{trade.get('daily_total_count', '-')}",
+                "5分足OK": f"{trade.get('intraday_ok_count', '-')}/{trade.get('intraday_total_count', '-')}",
+                "マルチ通過": "OK" if trade.get("multi_timeframe_pass") else "NG",
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -2343,6 +2642,9 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "損切り",
         "利確目標",
         "スコア",
+        "日足OK",
+        "5分足OK",
+        "マルチ通過",
         "結果",
         "終了時刻",
         "終了価格",
@@ -2381,6 +2683,53 @@ def _historical_scan_symbol_summary_table(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _replay_group_performance_table(trades: List[Dict[str, Any]], group_key: str, label: str, shares: int) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame()
+    rows = []
+    values = sorted({str(trade.get(group_key, "-")) for trade in trades})
+    for value in values:
+        scoped = [trade for trade in trades if str(trade.get(group_key, "-")) == value]
+        perf = summarize_replay_results(scoped)
+        money = summarize_replay_money(apply_replay_money_metrics(scoped, shares), shares)
+        rows.append(
+            {
+                label: value,
+                "仮想買い件数": len(scoped),
+                "勝率": _format_pct_value(perf.get("win_rate_pct")),
+                "純損益": _format_signed_yen(money.get("net_profit_yen")),
+                "損益比": _format_profit_loss_ratio(money.get("profit_loss_ratio")),
+                "最大連敗": money.get("max_loss_streak", 0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_multi_timeframe_performance(trades: List[Dict[str, Any]], shares: int) -> None:
+    if not trades:
+        return
+    prepared = []
+    for trade in trades:
+        row = dict(trade)
+        row["daily_ok_group"] = f"{row.get('daily_ok_count', '-')}/{row.get('daily_total_count', '-')}"
+        row["intraday_ok_group"] = f"{row.get('intraday_ok_count', '-')}/{row.get('intraday_total_count', '-')}"
+        row["multi_pass_group"] = "通過" if row.get("multi_timeframe_pass") else "未通過"
+        prepared.append(row)
+
+    st.markdown("**マルチ時間足別 成績**")
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("日足OK数別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "daily_ok_group", "日足OK", shares)), width="stretch", hide_index=True)
+        st.caption("entry_type別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "entry_type", "型", shares)), width="stretch", hide_index=True)
+    with cols[1]:
+        st.caption("5分足OK数別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "intraday_ok_group", "5分足OK", shares)), width="stretch", hide_index=True)
+        st.caption("マルチ時間足通過別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "multi_pass_group", "マルチ判定", shares)), width="stretch", hide_index=True)
 
 
 def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
@@ -2731,6 +3080,20 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     cooldown_label = rule_cols[3].selectbox("同一銘柄の再シグナル抑制", list(HISTORICAL_SCAN_COOLDOWN_OPTIONS.keys()), index=0, key="historical_scan_cooldown")
     shares = int(rule_cols[4].selectbox("想定株数", [100, 200, 300, 500, 1000], index=0, key="historical_scan_shares"))
 
+    mtf_cols = st.columns(5)
+    use_multi_timeframe = mtf_cols[0].toggle("マルチ時間足判定を使う", value=True, key="historical_scan_use_multi_timeframe")
+    daily_filter_required = mtf_cols[1].toggle("日足フィルター必須", value=True, key="historical_scan_daily_filter_required")
+    daily_min_ok = int(mtf_cols[2].selectbox("日足OK数の最低条件", [2, 3, 4], index=1, key="historical_scan_daily_min_ok"))
+    intraday_min_ok = int(mtf_cols[3].selectbox("5分足OK数の最低条件", [2, 3, 4], index=0, key="historical_scan_intraday_min_ok"))
+    mtf_options = mtf_cols[4].multiselect(
+        "使用条件",
+        ["VWAP", "出来高急増"],
+        default=["VWAP", "出来高急増"],
+        key="historical_scan_mtf_options",
+    )
+    use_vwap = "VWAP" in mtf_options
+    use_volume_spike = "出来高急増" in mtf_options
+
     max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
     target_records = watchlist.to_dict("records")[: max_symbols or len(watchlist)]
     if (max_symbols is None or int(max_symbols) > 30) and REPLAY_INTERVAL_OPTIONS[interval_label] == "5m":
@@ -2765,6 +3128,12 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 shares=shares,
                 max_symbols=max_symbols,
                 source_watchlist="watchlist.csv",
+                use_multi_timeframe=bool(use_multi_timeframe),
+                daily_filter_required=bool(daily_filter_required),
+                daily_min_ok=int(daily_min_ok),
+                intraday_min_ok=int(intraday_min_ok),
+                use_vwap=bool(use_vwap),
+                use_volume_spike=bool(use_volume_spike),
             )
             result = run_historical_scan_replay(target_records, config, progress_callback=_progress)
             store_result = insert_replay_trades(
@@ -2808,6 +3177,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         width="stretch",
         hide_index=True,
     )
+    _render_multi_timeframe_performance(trades, int(result["summary"].get("shares", shares)))
 
     _render_historical_scan_rankings(symbol_summary)
 
@@ -2848,9 +3218,12 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     if fetch_cols[0].button("過去データ取得", key="fetch_historical_replay_data_button", type="primary"):
         with st.spinner("過去データを取得しています..."):
             result = load_or_fetch_historical_data(symbol, period, interval)
+            daily_result = load_or_fetch_historical_data(symbol, "6mo", "1d")
         validation = validate_historical_ohlcv(result.data)
+        daily_validation = validate_historical_ohlcv(daily_result.data)
         st.session_state["replay_raw_data"] = result.data
         st.session_state["replay_data"] = validation.get("cleaned_data", result.data)
+        st.session_state["replay_daily_data"] = daily_validation.get("cleaned_data", daily_result.data)
         st.session_state["replay_data_validation"] = {
             key: value
             for key, value in validation.items()
@@ -2890,6 +3263,20 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     cooldown_bars = rule_cols[3].selectbox("連続シグナル抑制", [3, 6, 12, 24], index=2, key="replay_cooldown_bars")
     replay_shares = int(rule_cols[4].selectbox("想定株数", [100, 200, 300, 500, 1000], index=0, key="replay_shares"))
 
+    mtf_cols = st.columns(5)
+    use_multi_timeframe = mtf_cols[0].toggle("マルチ時間足判定", value=True, key="replay_use_multi_timeframe")
+    daily_filter_required = mtf_cols[1].toggle("日足フィルター必須", value=True, key="replay_daily_filter_required")
+    daily_min_ok = int(mtf_cols[2].selectbox("日足OK数", [2, 3, 4], index=1, key="replay_daily_min_ok"))
+    intraday_min_ok = int(mtf_cols[3].selectbox("5分足OK数", [2, 3, 4], index=0, key="replay_intraday_min_ok"))
+    option_pack = mtf_cols[4].multiselect(
+        "使用条件",
+        ["VWAP", "出来高急増"],
+        default=["VWAP", "出来高急増"],
+        key="replay_mtf_options",
+    )
+    use_vwap = "VWAP" in option_pack
+    use_volume_spike = "出来高急増" in option_pack
+
     start_at = _combine_date_time(start_date, start_time)
     end_at = _combine_date_time(end_date, end_time)
     run_disabled = start_at >= end_at
@@ -2902,6 +3289,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
                 symbol=normalize_jp_symbol(symbol),
                 name=name,
                 df=replay_data,
+                daily_df=st.session_state.get("replay_daily_data", pd.DataFrame()),
                 start_at=start_at,
                 end_at=end_at,
                 rule_config={
@@ -2911,6 +3299,11 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
                     "interval": interval,
                     "cooldown_bars": int(cooldown_bars),
                     "debug": True,
+                    "use_multi_timeframe": bool(use_multi_timeframe),
+                    "daily_min_ok": int(daily_min_ok) if daily_filter_required else 0,
+                    "intraday_min_ok": int(intraday_min_ok),
+                    "use_vwap": bool(use_vwap),
+                    "use_volume_spike": bool(use_volume_spike),
                 },
             )
             result["trades"] = apply_replay_money_metrics(result["trades"], replay_shares)
@@ -2936,6 +3329,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
         st.markdown("**リプレイ結果表**")
         if trades:
             st.dataframe(_safe_dataframe(_replay_result_table(trades, display_shares)), width="stretch", hide_index=True)
+            _render_multi_timeframe_performance(trades, display_shares)
         else:
             st.info("条件に一致する仮想買いポイントはありませんでした。")
 
@@ -3130,6 +3524,7 @@ def main() -> None:
 
     _render_count_metrics(buy, watch, avoid, failed)
     st.info("買い候補は下のタブから確認してください。トップ画面には詳細カードを表示していません。")
+    _render_logic_confirmation_section()
     if signals and len(failed) == len(signals):
         _render_all_failed_warning(failed)
 
