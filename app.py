@@ -1569,8 +1569,12 @@ def _select_rule_auto_log_candidates(
 def _summarize_virtual_trade_results(results: List[Dict[str, Any]]) -> Dict[str, int]:
     return {
         "saved_count": sum(1 for result in results if result.get("saved")),
-        "failed_count": sum(1 for result in results if not result.get("saved")),
         "duplicate_count": sum(1 for result in results if result.get("reason") == "duplicate_recent"),
+        "failed_count": sum(
+            1
+            for result in results
+            if not result.get("saved") and result.get("reason") != "duplicate_recent"
+        ),
     }
 
 
