@@ -18,17 +18,21 @@ from config import (
     ALERTS_LOG_PATH,
     DEFAULT_PRICE_PERIOD,
     OPENAI_API_ENABLED,
+    REPLAY_TRADES_DB_PATH,
     TRADES_PATH,
     VIRTUAL_TRADES_DB_PATH,
     get_setting,
 )
 from data_fetcher import fetch_price_data, normalize_jp_symbol
+from historical_data import HistoricalDataResult, load_or_fetch_historical_data
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
 from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
 from pattern_stats import calculate_pattern_stats
+from replay_engine import run_replay
+from replay_store import insert_replay_trades, load_replay_trades
 from scanner import (
     append_trade_candidate,
     build_signal_table,
@@ -119,6 +123,25 @@ INTRADAY_TABLE_COLUMNS = [
 PLOTLY_CHART_CONFIG = {
     "displayModeBar": False,
     "scrollZoom": False,
+}
+REPLAY_PERIOD_OPTIONS = {
+    "1ヶ月": "1mo",
+    "3ヶ月": "3mo",
+    "6ヶ月": "6mo",
+    "1年": "1y",
+}
+REPLAY_INTERVAL_OPTIONS = {
+    "5分足": "5m",
+    "15分足": "15m",
+    "1時間足": "60m",
+    "日足": "1d",
+}
+REPLAY_RULE_OPTIONS = ["すべて", "押し目反発", "ブレイク狙い", "後場V字回復"]
+REPLAY_RULE_LABEL_TO_SIGNAL = {
+    "すべて": "すべて",
+    "押し目反発": "押し目再反発",
+    "ブレイク狙い": "節目ブレイク",
+    "後場V字回復": "後場V字回復",
 }
 DISCORD_BUY_SCORE_THRESHOLD = 70
 DISCORD_COOLDOWN_MINUTES = 30
@@ -2162,6 +2185,281 @@ def _render_ai_virtual_trade_tab(
     _render_ai_debug_expander()
 
 
+def _combine_date_time(date_value: Any, time_value: Any) -> datetime:
+    return datetime.combine(date_value, time_value)
+
+
+def _display_replay_outcome(value: Any) -> str:
+    return {
+        "win": "勝ち",
+        "loss": "負け",
+        "open": "検証中",
+        "hit_take_profit": "利確到達",
+        "hit_stop_loss": "損切り到達",
+        "timeout": "期限到達",
+    }.get(str(value or ""), str(value or "-"))
+
+
+def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for trade in trades:
+        symbol = str(trade.get("symbol", "") or "")
+        name = str(trade.get("name", "") or "")
+        rows.append(
+            {
+                "仮想買い時刻": trade.get("signal_time", "-"),
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "型": trade.get("entry_type", "-"),
+                "買値": format_yen(trade.get("entry_price")),
+                "損切り": format_yen(trade.get("stop_loss")),
+                "利確目標": format_yen(trade.get("take_profit")),
+                "スコア": _format_score_value(trade.get("score")),
+                "結果": _display_replay_outcome(trade.get("outcome")),
+                "リターン": _format_pct_value(trade.get("return_pct")),
+                "最大利益率": _format_pct_value(trade.get("max_profit_pct")),
+                "最大下落率": _format_pct_value(trade.get("max_drawdown_pct")),
+                "保有期間": trade.get("holding_period", "-"),
+                "終了理由": _display_replay_outcome(trade.get("exit_reason")),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "仮想買い時刻",
+            "銘柄",
+            "型",
+            "買値",
+            "損切り",
+            "利確目標",
+            "スコア",
+            "結果",
+            "リターン",
+            "最大利益率",
+            "最大下落率",
+            "保有期間",
+            "終了理由",
+        ],
+    )
+
+
+def _replay_db_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    return _replay_result_table(df.to_dict("records"))
+
+
+def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
+    if not meta:
+        return
+    if meta.get("error_message"):
+        st.warning(f"{meta.get('error_type', 'error')}: {meta.get('error_message')}")
+    cols = st.columns(5)
+    cols[0].metric("取得データ件数", f"{meta.get('fetched_rows', 0)}件")
+    cols[1].metric("期間", meta.get("period_label", "-"))
+    cols[2].metric("時間足", meta.get("interval_label", "-"))
+    cols[3].metric("最初の日時", meta.get("first_timestamp", "-"))
+    cols[4].metric("最後の日時", meta.get("last_timestamp", "-"))
+    st.caption(f"データ元：{'キャッシュ' if meta.get('from_cache') else 'yfinance'} / symbol={meta.get('normalized_symbol', '-')}")
+
+
+def _render_replay_summary(summary: Dict[str, Any], saved_count: int) -> None:
+    cols = st.columns(5)
+    cols[0].metric("リプレイ実行件数", summary.get("evaluated_steps", 0))
+    cols[1].metric("仮想買い件数", summary.get("trade_count", 0))
+    cols[2].metric("勝率", _format_pct_value(summary.get("win_rate_pct")))
+    cols[3].metric("平均リターン", _format_pct_value(summary.get("avg_return_pct")))
+    cols[4].metric("DB保存", f"{saved_count}件")
+
+    cols = st.columns(5)
+    cols[0].metric("最大利益率平均", _format_pct_value(summary.get("avg_max_profit_pct")))
+    cols[1].metric("最大下落率平均", _format_pct_value(summary.get("avg_max_drawdown_pct")))
+    cols[2].metric("損切り到達", summary.get("hit_stop_loss_count", 0))
+    cols[3].metric("利確到達", summary.get("hit_take_profit_count", 0))
+    cols[4].metric("検証データ", f"{summary.get('data_rows', 0)}本")
+
+
+def _render_replay_chart(df: pd.DataFrame, trades: List[Dict[str, Any]]) -> None:
+    if df.empty:
+        return
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["Close"],
+            mode="lines",
+            name="終値",
+            line={"color": "#2563eb", "width": 1.6},
+        )
+    )
+    if trades:
+        buy_x = [pd.Timestamp(trade["signal_time"]) for trade in trades if trade.get("signal_time")]
+        buy_y = [trade.get("entry_price") for trade in trades if trade.get("signal_time")]
+        fig.add_trace(
+            go.Scatter(
+                x=buy_x,
+                y=buy_y,
+                mode="markers",
+                name="仮想買い",
+                marker={"color": "#16a34a", "size": 9, "symbol": "triangle-up"},
+            )
+        )
+        for index, trade in enumerate(trades):
+            start = pd.Timestamp(trade.get("signal_time"))
+            end = pd.Timestamp(trade.get("evaluated_until") or df.index[-1])
+            stop_loss = trade.get("stop_loss")
+            take_profit = trade.get("take_profit")
+            if stop_loss:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[start, end],
+                        y=[stop_loss, stop_loss],
+                        mode="lines",
+                        name="損切り" if index == 0 else None,
+                        showlegend=index == 0,
+                        line={"color": "#dc2626", "width": 1, "dash": "dot"},
+                    )
+                )
+            if take_profit:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[start, end],
+                        y=[take_profit, take_profit],
+                        mode="lines",
+                        name="利確" if index == 0 else None,
+                        showlegend=index == 0,
+                        line={"color": "#059669", "width": 1, "dash": "dot"},
+                    )
+                )
+    fig.update_layout(
+        height=420,
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+        yaxis_title="価格",
+        xaxis_title="",
+    )
+    _render_plotly_chart(fig, key="replay_price_chart")
+
+
+def _historical_result_to_meta(
+    result: HistoricalDataResult,
+    period_label: str,
+    interval_label: str,
+) -> Dict[str, Any]:
+    return {
+        "symbol": result.symbol,
+        "normalized_symbol": result.normalized_symbol,
+        "period": result.period,
+        "period_label": period_label,
+        "interval": result.interval,
+        "interval_label": interval_label,
+        "cache_path": str(result.cache_path),
+        "from_cache": result.from_cache,
+        "error_type": result.error_type,
+        "error_message": result.error_message,
+        "fetched_rows": result.fetched_rows,
+        "first_timestamp": result.first_timestamp,
+        "last_timestamp": result.last_timestamp,
+    }
+
+
+def _render_historical_replay_tab() -> None:
+    st.subheader("過去リプレイ検証")
+    st.caption("過去データを1本ずつ進め、その時点までの情報だけでルール買いを検証します。実売買・発注・OpenAI API呼び出しは行いません。")
+
+    input_cols = st.columns([1.1, 1.1, 1, 1])
+    symbol = input_cols[0].text_input("銘柄コード", value="5803", key="replay_symbol_input")
+    name = input_cols[1].text_input("銘柄名（任意）", value="", key="replay_name_input")
+    period_label = input_cols[2].selectbox("期間", list(REPLAY_PERIOD_OPTIONS.keys()), index=0, key="replay_period_label")
+    interval_label = input_cols[3].selectbox("時間足", list(REPLAY_INTERVAL_OPTIONS.keys()), index=0, key="replay_interval_label")
+    period = REPLAY_PERIOD_OPTIONS[period_label]
+    interval = REPLAY_INTERVAL_OPTIONS[interval_label]
+
+    fetch_cols = st.columns([1, 3])
+    if fetch_cols[0].button("過去データ取得", key="fetch_historical_replay_data_button", type="primary"):
+        with st.spinner("過去データを取得しています..."):
+            result = load_or_fetch_historical_data(symbol, period, interval)
+        st.session_state["replay_data"] = result.data
+        st.session_state["replay_fetch_meta"] = _historical_result_to_meta(result, period_label, interval_label)
+        st.session_state["replay_last_error"] = result.error_message or ""
+
+    fetch_cols[1].caption("無料データでは時間足と期間の組み合わせに制限があります。取得できない場合もアプリは落ちません。")
+
+    replay_data = st.session_state.get("replay_data", pd.DataFrame())
+    fetch_meta = st.session_state.get("replay_fetch_meta", {})
+    _render_replay_fetch_summary(fetch_meta)
+
+    if replay_data is None or replay_data.empty:
+        st.info("まだ過去データがありません。まず「過去データ取得」を押してください。")
+        st.button("リプレイ検証を実行", key="run_historical_replay_button", type="primary", disabled=True)
+        recent = load_replay_trades(limit=30)
+        if not recent.empty:
+            with st.expander("保存済みリプレイ結果", expanded=False):
+                st.dataframe(_safe_dataframe(_replay_db_display_table(recent)), width="stretch", hide_index=True)
+        return
+
+    first_dt = pd.Timestamp(replay_data.index[0]).to_pydatetime()
+    last_dt = pd.Timestamp(replay_data.index[-1]).to_pydatetime()
+    range_cols = st.columns(4)
+    start_date = range_cols[0].date_input("開始日", value=first_dt.date(), key="replay_start_date")
+    start_time = range_cols[1].time_input("開始時刻", value=first_dt.time().replace(second=0, microsecond=0), key="replay_start_time")
+    end_date = range_cols[2].date_input("終了日", value=last_dt.date(), key="replay_end_date")
+    end_time = range_cols[3].time_input("終了時刻", value=last_dt.time().replace(second=0, microsecond=0), key="replay_end_time")
+
+    rule_cols = st.columns(4)
+    min_score = rule_cols[0].selectbox("最小スコア", [60, 70, 75, 80], index=1, key="replay_min_score")
+    target_rule_label = rule_cols[1].selectbox("対象ルール", REPLAY_RULE_OPTIONS, index=0, key="replay_target_rule")
+    max_trades = rule_cols[2].selectbox("最大仮想買い件数", [1, 3, 5, 10, 20, 50], index=3, key="replay_max_trades")
+    cooldown_bars = rule_cols[3].selectbox("連続シグナル抑制", [3, 6, 12, 24], index=2, key="replay_cooldown_bars")
+
+    start_at = _combine_date_time(start_date, start_time)
+    end_at = _combine_date_time(end_date, end_time)
+    run_disabled = start_at >= end_at
+    if run_disabled:
+        st.warning("開始日時は終了日時より前にしてください。")
+
+    if st.button("リプレイ検証を実行", key="run_historical_replay_button", type="primary", disabled=run_disabled):
+        with st.spinner("過去リプレイ検証を実行しています..."):
+            result = run_replay(
+                symbol=normalize_jp_symbol(symbol),
+                name=name,
+                df=replay_data,
+                start_at=start_at,
+                end_at=end_at,
+                rule_config={
+                    "min_score": int(min_score),
+                    "target_rule": REPLAY_RULE_LABEL_TO_SIGNAL.get(target_rule_label, "すべて"),
+                    "max_trades": int(max_trades),
+                    "interval": interval,
+                    "cooldown_bars": int(cooldown_bars),
+                },
+            )
+            store_result = insert_replay_trades(result["trades"])
+        st.session_state["replay_last_result"] = result
+        st.session_state["replay_last_store_result"] = store_result
+        st.success(f"リプレイ検証を完了しました。仮想買い {len(result['trades'])}件 / DB保存 {store_result['saved_count']}件")
+
+    last_result = st.session_state.get("replay_last_result", {})
+    last_store = st.session_state.get("replay_last_store_result", {})
+    if last_result:
+        summary = last_result.get("summary", {})
+        trades = last_result.get("trades", [])
+        _render_replay_summary(summary, int(last_store.get("saved_count", 0)))
+        _render_replay_chart(replay_data, trades)
+        st.markdown("**リプレイ結果表**")
+        if trades:
+            st.dataframe(_safe_dataframe(_replay_result_table(trades)), width="stretch", hide_index=True)
+        else:
+            st.info("条件に一致する仮想買いポイントはありませんでした。")
+
+    with st.expander("保存済みリプレイ結果", expanded=False):
+        recent = load_replay_trades(limit=100)
+        if recent.empty:
+            st.info("保存済みのリプレイ結果はありません。")
+        else:
+            st.dataframe(_safe_dataframe(_replay_db_display_table(recent)), width="stretch", hide_index=True)
+        st.caption(f"保存先: {REPLAY_TRADES_DB_PATH}")
+
+
 def _render_virtual_performance_tab() -> None:
     st.subheader("仮想成績")
     st.caption("AI仮想取引の保存結果を後追いで検証します。実売買の履歴とは完全に分離しています。")
@@ -2340,6 +2638,7 @@ def main() -> None:
         tab_avoid,
         tab_intraday,
         tab_ai_virtual,
+        tab_historical_replay,
         tab_virtual_performance,
         tab_stock_personality,
         tab_pattern_stats,
@@ -2354,6 +2653,7 @@ def main() -> None:
             "触らない",
             "場中エントリー監視",
             "AI仮想取引",
+            "過去リプレイ検証",
             "仮想成績",
             "銘柄別クセ",
             "パターン別勝率",
@@ -2380,6 +2680,9 @@ def main() -> None:
 
     with tab_ai_virtual:
         _render_ai_virtual_trade_tab(buy, watch)
+
+    with tab_historical_replay:
+        _render_historical_replay_tab()
 
     with tab_virtual_performance:
         _render_virtual_performance_tab()

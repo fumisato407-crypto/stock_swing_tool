@@ -18,6 +18,7 @@ WATCHLIST_PATH = BASE_DIR / "watchlist.csv"
 TRADES_PATH = BASE_DIR / "trades.csv"
 ALERTS_LOG_PATH = BASE_DIR / "alerts_log.csv"
 VIRTUAL_TRADES_DB_PATH = BASE_DIR / "virtual_trades.db"
+REPLAY_TRADES_DB_PATH = BASE_DIR / "replay_trades.db"
 
 def get_setting(name: str, default: str = "") -> str:
     """Read settings in priority order: Streamlit Secrets, env vars, then .env."""
