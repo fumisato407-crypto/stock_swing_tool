@@ -16,11 +16,17 @@ from time_utils import now_jst_iso
 REPLAY_COLUMNS = [
     "id",
     "replay_run_id",
+    "replay_mode",
     "created_at_jst",
     "symbol",
     "name",
     "replay_start_at",
     "replay_end_at",
+    "scan_time",
+    "selected_rank",
+    "scan_score",
+    "category",
+    "source_watchlist",
     "signal_time",
     "entry_price",
     "stop_loss",
@@ -59,11 +65,17 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
             CREATE TABLE IF NOT EXISTS replay_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 replay_run_id TEXT NOT NULL,
+                replay_mode TEXT,
                 created_at_jst TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 name TEXT,
                 replay_start_at TEXT,
                 replay_end_at TEXT,
+                scan_time TEXT,
+                selected_rank INTEGER,
+                scan_score REAL,
+                category TEXT,
+                source_watchlist TEXT,
                 signal_time TEXT,
                 entry_price REAL,
                 stop_loss REAL,
@@ -100,6 +112,12 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
             "required_capital_yen": "REAL",
             "profit_yen": "REAL",
             "cumulative_profit_yen": "REAL",
+            "replay_mode": "TEXT",
+            "scan_time": "TEXT",
+            "selected_rank": "INTEGER",
+            "scan_score": "REAL",
+            "category": "TEXT",
+            "source_watchlist": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing:
@@ -119,11 +137,17 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
     ensure_replay_store(path)
     payload = {
         "replay_run_id": str(record.get("replay_run_id", "")),
+        "replay_mode": str(record.get("replay_mode", "single_symbol")),
         "created_at_jst": str(record.get("created_at_jst") or now_jst_iso()),
         "symbol": str(record.get("symbol", "")),
         "name": str(record.get("name", "")),
         "replay_start_at": str(record.get("replay_start_at", "")),
         "replay_end_at": str(record.get("replay_end_at", "")),
+        "scan_time": str(record.get("scan_time", "")),
+        "selected_rank": record.get("selected_rank"),
+        "scan_score": record.get("scan_score"),
+        "category": str(record.get("category", "")),
+        "source_watchlist": str(record.get("source_watchlist", "")),
         "signal_time": str(record.get("signal_time", "")),
         "entry_price": record.get("entry_price"),
         "stop_loss": record.get("stop_loss"),
@@ -152,13 +176,15 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
         cur = conn.execute(
             """
             INSERT INTO replay_trades (
-                replay_run_id, created_at_jst, symbol, name, replay_start_at, replay_end_at,
+                replay_run_id, replay_mode, created_at_jst, symbol, name, replay_start_at, replay_end_at,
+                scan_time, selected_rank, scan_score, category, source_watchlist,
                 signal_time, entry_price, stop_loss, take_profit, score, entry_type, rule_name,
                 status, outcome, exit_price, shares, required_capital_yen, profit_yen, cumulative_profit_yen,
                 return_pct, max_profit_pct, max_drawdown_pct,
                 hit_stop_loss, hit_take_profit, evaluated_until, holding_period, exit_reason, notes_json
             ) VALUES (
-                :replay_run_id, :created_at_jst, :symbol, :name, :replay_start_at, :replay_end_at,
+                :replay_run_id, :replay_mode, :created_at_jst, :symbol, :name, :replay_start_at, :replay_end_at,
+                :scan_time, :selected_rank, :scan_score, :category, :source_watchlist,
                 :signal_time, :entry_price, :stop_loss, :take_profit, :score, :entry_type, :rule_name,
                 :status, :outcome, :exit_price, :shares, :required_capital_yen, :profit_yen, :cumulative_profit_yen,
                 :return_pct, :max_profit_pct, :max_drawdown_pct,
@@ -196,3 +222,90 @@ def load_replay_trades(limit: int = 500, path: Path = REPLAY_TRADES_DB_PATH) -> 
     query = "SELECT * FROM replay_trades ORDER BY created_at_jst DESC, id DESC LIMIT ?"
     with closing(_connect(path)) as conn:
         return pd.read_sql_query(query, conn, params=[int(limit)])
+
+
+def ensure_replay_runs_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
+    ensure_replay_store(path)
+    with closing(_connect(path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS replay_runs (
+                replay_run_id TEXT PRIMARY KEY,
+                created_at_jst TEXT NOT NULL,
+                replay_mode TEXT,
+                symbols_count INTEGER,
+                period TEXT,
+                interval TEXT,
+                scan_interval TEXT,
+                start_at TEXT,
+                end_at TEXT,
+                min_score REAL,
+                target_mode TEXT,
+                max_buys_per_scan INTEGER,
+                cooldown TEXT,
+                shares INTEGER,
+                total_scan_steps INTEGER,
+                total_candidates INTEGER,
+                total_trades INTEGER,
+                total_profit_yen REAL,
+                win_rate REAL,
+                profit_factor REAL,
+                error_count INTEGER,
+                summary_json TEXT
+            )
+            """
+        )
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(replay_runs)").fetchall()}
+        migrations = {
+            "summary_json": "TEXT",
+        }
+        for column, column_type in migrations.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE replay_runs ADD COLUMN {column} {column_type}")
+        conn.commit()
+
+
+def insert_replay_run(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PATH) -> None:
+    ensure_replay_runs_store(path)
+    payload = {
+        "replay_run_id": str(record.get("replay_run_id", "")),
+        "created_at_jst": str(record.get("created_at_jst") or now_jst_iso()),
+        "replay_mode": str(record.get("replay_mode", "")),
+        "symbols_count": record.get("symbols_count"),
+        "period": str(record.get("period", "")),
+        "interval": str(record.get("interval", "")),
+        "scan_interval": str(record.get("scan_interval", "")),
+        "start_at": str(record.get("start_at", "")),
+        "end_at": str(record.get("end_at", "")),
+        "min_score": record.get("min_score"),
+        "target_mode": str(record.get("target_mode", "")),
+        "max_buys_per_scan": record.get("max_buys_per_scan"),
+        "cooldown": str(record.get("cooldown", "")),
+        "shares": record.get("shares"),
+        "total_scan_steps": record.get("total_scan_steps"),
+        "total_candidates": record.get("total_candidates"),
+        "total_trades": record.get("total_trades"),
+        "total_profit_yen": record.get("total_profit_yen"),
+        "win_rate": record.get("win_rate"),
+        "profit_factor": record.get("profit_factor"),
+        "error_count": record.get("error_count"),
+        "summary_json": _json_text(record.get("summary_json", record)),
+    }
+    with closing(_connect(path)) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO replay_runs (
+                replay_run_id, created_at_jst, replay_mode, symbols_count, period, interval,
+                scan_interval, start_at, end_at, min_score, target_mode, max_buys_per_scan,
+                cooldown, shares, total_scan_steps, total_candidates, total_trades,
+                total_profit_yen, win_rate, profit_factor, error_count, summary_json
+            ) VALUES (
+                :replay_run_id, :created_at_jst, :replay_mode, :symbols_count, :period, :interval,
+                :scan_interval, :start_at, :end_at, :min_score, :target_mode, :max_buys_per_scan,
+                :cooldown, :shares, :total_scan_steps, :total_candidates, :total_trades,
+                :total_profit_yen, :win_rate, :profit_factor, :error_count, :summary_json
+            )
+            """,
+            payload,
+        )
+        conn.commit()

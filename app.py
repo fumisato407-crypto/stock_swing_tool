@@ -24,6 +24,7 @@ from config import (
     get_setting,
 )
 from data_fetcher import fetch_price_data, normalize_jp_symbol
+from historical_scan_replay import HistoricalScanReplayConfig, run_historical_scan_replay
 from historical_data import HistoricalDataResult, YFINANCE_AUTO_ADJUST, load_or_fetch_historical_data, validate_historical_ohlcv
 from intraday_scanner import fetch_intraday_data, scan_intraday_entries
 from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
@@ -32,7 +33,7 @@ from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
 from pattern_stats import calculate_pattern_stats
 from replay_engine import apply_replay_money_metrics, run_replay, summarize_replay_money
-from replay_store import insert_replay_trades, load_replay_trades
+from replay_store import insert_replay_run, insert_replay_trades, load_replay_trades
 from scanner import (
     append_trade_candidate,
     build_signal_table,
@@ -142,6 +143,29 @@ REPLAY_RULE_LABEL_TO_SIGNAL = {
     "押し目反発": "押し目再反発",
     "ブレイク狙い": "節目ブレイク",
     "後場V字回復": "後場V字回復",
+}
+HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS = {
+    "10": 10,
+    "30": 30,
+    "50": 50,
+    "全件": None,
+}
+HISTORICAL_SCAN_INTERVAL_OPTIONS = {
+    "5分": "5m",
+    "15分": "15m",
+    "30分": "30m",
+    "1時間": "60m",
+    "1日": "1d",
+}
+HISTORICAL_SCAN_TARGET_OPTIONS = {
+    "買い候補のみ": "buy_only",
+    "買い候補＋監視": "buy_watch",
+}
+HISTORICAL_SCAN_COOLDOWN_OPTIONS = {
+    "30分": "30m",
+    "1時間": "1h",
+    "3時間": "3h",
+    "当日中": "day",
 }
 DISCORD_BUY_SCORE_THRESHOLD = 70
 DISCORD_COOLDOWN_MINUTES = 30
@@ -2282,6 +2306,83 @@ def _replay_db_display_table(df: pd.DataFrame) -> pd.DataFrame:
     return _replay_result_table(df.to_dict("records"))
 
 
+def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> pd.DataFrame:
+    rows = []
+    display_trades = apply_replay_money_metrics(trades, shares)
+    for trade in display_trades:
+        symbol = str(trade.get("symbol", "") or "")
+        name = str(trade.get("name", "") or "")
+        rows.append(
+            {
+                "スキャン時刻": trade.get("scan_time", "-"),
+                "仮想買い時刻": trade.get("signal_time", "-"),
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "順位": trade.get("selected_rank", "-"),
+                "型": trade.get("entry_type", "-"),
+                "買値": format_yen(trade.get("entry_price")),
+                "損切り": format_yen(trade.get("stop_loss")),
+                "利確目標": format_yen(trade.get("take_profit")),
+                "スコア": _format_score_value(trade.get("scan_score", trade.get("score"))),
+                "結果": _display_replay_outcome(trade.get("outcome")),
+                "終了時刻": trade.get("evaluated_until", "-"),
+                "終了価格": format_yen(trade.get("exit_price")),
+                "リターン": _format_pct_value(trade.get("return_pct")),
+                "株数": f"{trade.get('shares', shares)}株",
+                "必要資金": _format_plain_yen(trade.get("required_capital_yen")),
+                "損益円": _format_signed_yen(trade.get("profit_yen")),
+                "累計損益": _format_signed_yen(trade.get("cumulative_profit_yen")),
+            }
+        )
+    columns = [
+        "スキャン時刻",
+        "仮想買い時刻",
+        "銘柄",
+        "順位",
+        "型",
+        "買値",
+        "損切り",
+        "利確目標",
+        "スコア",
+        "結果",
+        "終了時刻",
+        "終了価格",
+        "リターン",
+        "株数",
+        "必要資金",
+        "損益円",
+        "累計損益",
+    ]
+    return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
+
+
+def _historical_scan_symbol_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", "") or "")
+        name = str(row.get("name", "") or "")
+        rows.append(
+            {
+                "銘柄": f"{symbol} {name}".strip() or "-",
+                "データ件数": int(row.get("data_rows", 0) or 0),
+                "仮想買い件数": int(row.get("trade_count", 0) or 0),
+                "勝率": _format_pct_value(row.get("win_rate_pct")),
+                "純損益": _format_signed_yen(row.get("net_profit_yen")),
+                "累計利益": _format_signed_yen(row.get("gross_profit_yen")),
+                "累計損失": _format_signed_yen(row.get("gross_loss_yen")),
+                "損益比": _format_profit_loss_ratio(row.get("profit_loss_ratio")),
+                "平均リターン": _format_pct_value(row.get("avg_return_pct")),
+                "最大利益": _format_signed_yen(row.get("max_profit_yen")),
+                "最大損失": _format_signed_yen(row.get("max_loss_yen")),
+                "最大連勝": int(row.get("max_win_streak", 0) or 0),
+                "最大連敗": int(row.get("max_loss_streak", 0) or 0),
+                "エラー": row.get("error", ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
     if not meta:
         return
@@ -2421,6 +2522,49 @@ def _render_replay_profit_curve(trades: List[Dict[str, Any]], shares: int) -> No
     _render_plotly_chart(fig, key="replay_profit_curve")
 
 
+def _render_symbol_profit_bar(symbol_summary: pd.DataFrame) -> None:
+    if symbol_summary.empty or "net_profit_yen" not in symbol_summary.columns:
+        return
+    top = symbol_summary.copy()
+    top["label"] = (top["symbol"].astype(str) + " " + top["name"].fillna("").astype(str)).str.strip()
+    top = top.sort_values("net_profit_yen", ascending=False).head(20)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=top["label"],
+            y=top["net_profit_yen"],
+            name="銘柄別純損益",
+            marker_color=["#16a34a" if value >= 0 else "#dc2626" for value in top["net_profit_yen"]],
+        )
+    )
+    fig.update_layout(height=340, margin={"l": 10, "r": 10, "t": 30, "b": 90}, yaxis_title="円", xaxis_title="")
+    _render_plotly_chart(fig, key="historical_scan_symbol_profit_bar")
+
+
+def _render_selected_count_chart(selected_by_scan_time: List[Dict[str, Any]]) -> None:
+    if not selected_by_scan_time:
+        return
+    df = pd.DataFrame(selected_by_scan_time)
+    if df.empty:
+        return
+    df["scan_time"] = pd.to_datetime(df["scan_time"], errors="coerce")
+    df = df.dropna(subset=["scan_time"])
+    if df.empty:
+        return
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["scan_time"],
+            y=df["selected_count"],
+            mode="lines",
+            name="採用銘柄数",
+            line={"color": "#7c3aed", "width": 1.8},
+        )
+    )
+    fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 30, "b": 10}, yaxis_title="件", xaxis_title="")
+    _render_plotly_chart(fig, key="historical_scan_selected_count_chart")
+
+
 def _render_replay_chart(df: pd.DataFrame, trades: List[Dict[str, Any]]) -> None:
     if df.empty:
         return
@@ -2505,9 +2649,192 @@ def _historical_result_to_meta(
     }
 
 
-def _render_historical_replay_tab() -> None:
+def _render_historical_scan_overall_summary(result: Dict[str, Any]) -> None:
+    summary = result.get("summary", {})
+    st.markdown("**全体サマリー**")
+    cols = st.columns(6)
+    cols[0].metric("対象銘柄", summary.get("symbols_count", 0))
+    cols[1].metric("取得成功", summary.get("fetch_success_count", 0))
+    cols[2].metric("取得失敗", summary.get("fetch_failed_count", 0))
+    cols[3].metric("スキャン回数", summary.get("total_scan_steps", 0))
+    cols[4].metric("仮想買い", summary.get("total_trades", 0))
+    cols[5].metric("勝率", _format_pct_value(summary.get("win_rate_pct")))
+
+    _render_replay_money_summary(result.get("money_summary", {}))
+
+
+def _render_historical_scan_rankings(symbol_summary: pd.DataFrame) -> None:
+    if symbol_summary.empty:
+        return
+    st.markdown("**ランキング**")
+    tradable = symbol_summary[pd.to_numeric(symbol_summary.get("trade_count", 0), errors="coerce").fillna(0) > 0].copy()
+    if tradable.empty:
+        st.info("ランキング対象の仮想買い結果がありません。")
+        return
+    ranking_cols = st.columns(2)
+    with ranking_cols[0]:
+        st.caption("純損益ランキング")
+        st.dataframe(
+            _safe_dataframe(_historical_scan_symbol_summary_table(tradable.sort_values("net_profit_yen", ascending=False).head(10))),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption("勝率ランキング")
+        st.dataframe(
+            _safe_dataframe(_historical_scan_symbol_summary_table(tradable.sort_values("win_rate_pct", ascending=False).head(10))),
+            width="stretch",
+            hide_index=True,
+        )
+    with ranking_cols[1]:
+        st.caption("損益比ランキング")
+        ratio_sorted = tradable.copy()
+        ratio_sorted["profit_loss_ratio"] = pd.to_numeric(ratio_sorted["profit_loss_ratio"], errors="coerce").fillna(-1)
+        st.dataframe(
+            _safe_dataframe(_historical_scan_symbol_summary_table(ratio_sorted.sort_values("profit_loss_ratio", ascending=False).head(10))),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption("最大損失が小さいランキング")
+        loss_sorted = tradable.copy()
+        loss_sorted["max_loss_yen"] = pd.to_numeric(loss_sorted["max_loss_yen"], errors="coerce").fillna(0)
+        st.dataframe(
+            _safe_dataframe(_historical_scan_symbol_summary_table(loss_sorted.sort_values("max_loss_yen", ascending=False).head(10))),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
+    st.markdown("**watchlist過去スキャン再現**")
+    st.caption("market_runner.pyの過去版です。watchlist全体を過去の各時刻でスキャンし、当時の買い候補を仮想買いとして検証します。")
+    if watchlist.empty:
+        st.warning("watchlist.csvに有効な銘柄がありません。")
+        return
+
+    option_cols = st.columns(4)
+    max_symbols_label = option_cols[0].selectbox("最大対象銘柄数", list(HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS.keys()), index=1, key="historical_scan_max_symbols")
+    period_label = option_cols[1].selectbox("期間", list(REPLAY_PERIOD_OPTIONS.keys()), index=0, key="historical_scan_period")
+    interval_label = option_cols[2].selectbox("時間足", list(REPLAY_INTERVAL_OPTIONS.keys()), index=0, key="historical_scan_interval")
+    scan_interval_label = option_cols[3].selectbox("スキャン間隔", list(HISTORICAL_SCAN_INTERVAL_OPTIONS.keys()), index=0, key="historical_scan_scan_interval")
+
+    today = datetime.now().date()
+    date_cols = st.columns(4)
+    start_date = date_cols[0].date_input("開始日", value=today - timedelta(days=30), key="historical_scan_start_date")
+    start_time = date_cols[1].time_input("開始時刻", value=dt_time(9, 0), key="historical_scan_start_time")
+    end_date = date_cols[2].date_input("終了日", value=today, key="historical_scan_end_date")
+    end_time = date_cols[3].time_input("終了時刻", value=dt_time(15, 30), key="historical_scan_end_time")
+
+    rule_cols = st.columns(5)
+    min_score = int(rule_cols[0].selectbox("最小スコア", [60, 70, 75, 80], index=1, key="historical_scan_min_score"))
+    target_label = rule_cols[1].selectbox("対象", list(HISTORICAL_SCAN_TARGET_OPTIONS.keys()), index=0, key="historical_scan_target_mode")
+    max_buys = int(rule_cols[2].selectbox("1回の最大仮想買い件数", [1, 3, 5, 10], index=1, key="historical_scan_max_buys"))
+    cooldown_label = rule_cols[3].selectbox("同一銘柄の再シグナル抑制", list(HISTORICAL_SCAN_COOLDOWN_OPTIONS.keys()), index=0, key="historical_scan_cooldown")
+    shares = int(rule_cols[4].selectbox("想定株数", [100, 200, 300, 500, 1000], index=0, key="historical_scan_shares"))
+
+    max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
+    target_records = watchlist.to_dict("records")[: max_symbols or len(watchlist)]
+    if (max_symbols is None or int(max_symbols) > 30) and REPLAY_INTERVAL_OPTIONS[interval_label] == "5m":
+        st.warning("5分足で30銘柄超は時間がかかります。まずは10〜30銘柄での確認を推奨します。")
+
+    start_at = _combine_date_time(start_date, start_time)
+    end_at = _combine_date_time(end_date, end_time)
+    run_disabled = start_at >= end_at
+    if run_disabled:
+        st.warning("開始日時は終了日時より前にしてください。")
+
+    if st.button("過去スキャン再現を実行", key="run_historical_scan_replay_button", type="primary", disabled=run_disabled):
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+
+        def _progress(stage: str, current: int, total: int, label: str) -> None:
+            pct = int(min(100, max(0, current / max(1, total) * 100)))
+            progress_bar.progress(pct)
+            status_box.info(f"{stage} {current}/{total} {label}")
+
+        with st.spinner("watchlist過去スキャン再現を実行しています..."):
+            config = HistoricalScanReplayConfig(
+                period=REPLAY_PERIOD_OPTIONS[period_label],
+                interval=REPLAY_INTERVAL_OPTIONS[interval_label],
+                start_at=start_at,
+                end_at=end_at,
+                scan_interval=HISTORICAL_SCAN_INTERVAL_OPTIONS[scan_interval_label],
+                min_score=min_score,
+                target_mode=HISTORICAL_SCAN_TARGET_OPTIONS[target_label],
+                max_buys_per_scan=max_buys,
+                cooldown=HISTORICAL_SCAN_COOLDOWN_OPTIONS[cooldown_label],
+                shares=shares,
+                max_symbols=max_symbols,
+                source_watchlist="watchlist.csv",
+            )
+            result = run_historical_scan_replay(target_records, config, progress_callback=_progress)
+            store_result = insert_replay_trades(
+                result["trades"],
+                replay_run_id=result["summary"].get("replay_run_id"),
+            )
+            run_record = {
+                **result["summary"],
+                "created_at_jst": now_jst_iso(),
+                "total_profit_yen": result["money_summary"].get("net_profit_yen"),
+                "win_rate": result["summary"].get("win_rate_pct"),
+                "summary_json": result["summary"],
+            }
+            insert_replay_run(run_record)
+        st.session_state["historical_scan_replay_result"] = result
+        st.session_state["historical_scan_replay_store"] = store_result
+        status_box.success(f"完了: 仮想買い {len(result['trades'])}件 / DB保存 {store_result['saved_count']}件")
+
+    result = st.session_state.get("historical_scan_replay_result")
+    store = st.session_state.get("historical_scan_replay_store", {})
+    if not result:
+        st.info("まだ過去スキャン再現の結果はありません。条件を設定して実行してください。")
+        return
+
+    _render_historical_scan_overall_summary(result)
+    st.caption(f"DB保存: {store.get('saved_count', 0)}件 / {result.get('lookahead_note', '')}")
+
+    trades = result.get("trades", [])
+    symbol_summary = result.get("symbol_summary", pd.DataFrame())
+    st.markdown("**グラフ**")
+    _render_replay_profit_curve(trades, int(result["summary"].get("shares", shares)))
+    _render_symbol_profit_bar(symbol_summary)
+    _render_selected_count_chart(result.get("selected_by_scan_time", []))
+
+    st.markdown("**銘柄別サマリー**")
+    st.dataframe(_safe_dataframe(_historical_scan_symbol_summary_table(symbol_summary)), width="stretch", hide_index=True)
+
+    st.markdown("**トレード一覧**")
+    st.dataframe(
+        _safe_dataframe(_historical_scan_trade_table(trades, int(result["summary"].get("shares", shares)))),
+        width="stretch",
+        hide_index=True,
+    )
+
+    _render_historical_scan_rankings(symbol_summary)
+
+    with st.expander("詳細デバッグ情報", expanded=False):
+        failures = result.get("fetch_failures", [])
+        if failures:
+            st.markdown("**取得失敗銘柄**")
+            st.dataframe(_safe_dataframe(pd.DataFrame(failures)), width="stretch", hide_index=True)
+        else:
+            st.caption("取得失敗銘柄はありません。")
+        st.markdown("**取得メタ情報**")
+        st.dataframe(_safe_dataframe(pd.DataFrame(result.get("fetch_meta", []))), width="stretch", hide_index=True)
+        st.caption(result.get("lookahead_note", ""))
+
+
+def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     st.subheader("過去リプレイ検証")
     st.caption("過去データを1本ずつ進め、その時点までの情報だけでルール買いを検証します。実売買・発注・OpenAI API呼び出しは行いません。")
+    replay_mode = st.radio(
+        "モード",
+        ["単一銘柄リプレイ", "watchlist過去スキャン再現"],
+        horizontal=True,
+        key="historical_replay_mode",
+    )
+    if replay_mode == "watchlist過去スキャン再現":
+        _render_watchlist_historical_scan_tab(watchlist)
+        return
 
     input_cols = st.columns([1.1, 1.1, 1, 1])
     symbol = input_cols[0].text_input("銘柄コード", value="5803", key="replay_symbol_input")
@@ -2857,7 +3184,7 @@ def main() -> None:
         _render_ai_virtual_trade_tab(buy, watch)
 
     with tab_historical_replay:
-        _render_historical_replay_tab()
+        _render_historical_replay_tab(watchlist)
 
     with tab_virtual_performance:
         _render_virtual_performance_tab()
