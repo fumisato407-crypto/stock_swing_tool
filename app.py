@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from alert_builder import alert_key, append_alert_log, build_buy_candidate_discord_text, send_discord_webhook
+from auto_virtual_logger import run_rule_based_virtual_logging, select_rule_buy_candidates
 from config import (
     AI_VIRTUAL_MODEL,
     ALERTS_LOG_PATH,
@@ -1562,16 +1563,7 @@ def _select_rule_auto_log_candidates(
     min_score: int,
     max_count: int,
 ) -> List[Dict[str, Any]]:
-    allowed_categories = {"買い候補"}
-    if target_mode == "buy_watch":
-        allowed_categories.add("監視")
-
-    candidates = [
-        signal
-        for signal in signals
-        if signal.get("category") in allowed_categories and _score(signal) >= int(min_score)
-    ]
-    return sorted(candidates, key=lambda item: _score(item), reverse=True)[: int(max_count)]
+    return select_rule_buy_candidates(signals, target_mode, min_score, max_count)
 
 
 def _summarize_virtual_trade_results(results: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -1605,12 +1597,14 @@ def _run_rule_auto_log_once() -> Dict[str, Any]:
         "max_count": max_count,
         "last_auto_save_at": st.session_state.get("ai_rule_auto_last_save_at", "-"),
         "next_run_hint": "-",
+        "latest_signals_count": len(signals),
         "target_count": len(candidates),
         "saved_count": 0,
         "failed_count": 0,
         "duplicate_count": 0,
         "openai_call_count": int(st.session_state.get("openai_call_count", 0)),
         "last_error": "",
+        "db_path": str(VIRTUAL_TRADES_DB_PATH),
         "status": "skipped",
         "reason": "",
     }
@@ -1656,15 +1650,24 @@ def _run_rule_auto_log_once() -> Dict[str, Any]:
         return summary
 
     try:
-        results = process_virtual_trade_signals(candidates, use_openai=False)
-        counts = _summarize_virtual_trade_results(results)
-        summary.update(counts)
+        log_summary = run_rule_based_virtual_logging(signals, target_mode, min_score, max_count)
+        results = log_summary.get("results", [])
+        summary.update(
+            {
+                "target_count": log_summary.get("selected_count", len(candidates)),
+                "saved_count": log_summary.get("saved_count", 0),
+                "failed_count": log_summary.get("failed_count", 0),
+                "duplicate_count": log_summary.get("duplicate_count", 0),
+                "db_path": log_summary.get("db_path", str(VIRTUAL_TRADES_DB_PATH)),
+                "last_error": log_summary.get("error", ""),
+            }
+        )
         summary["status"] = "executed"
-        summary["reason"] = "saved" if counts["saved_count"] else "no_new_saved"
+        summary["reason"] = "saved" if summary["saved_count"] else "no_new_saved"
         st.session_state["last_ai_virtual_results"] = results
         st.session_state["ai_rule_auto_last_results"] = results
         st.session_state["ai_rule_auto_last_save_at"] = summary["checked_at_jst"]
-        st.session_state["ai_rule_auto_last_error"] = ""
+        st.session_state["ai_rule_auto_last_error"] = str(summary.get("last_error", ""))
         _refresh_ai_virtual_db_debug_state()
     except Exception as exc:
         summary["status"] = "error"
@@ -1684,8 +1687,10 @@ def _render_rule_auto_log_status(summary: Dict[str, Any]) -> None:
     st.caption(f"対象条件：{summary.get('target_mode', '-')}")
     st.caption(f"最小スコア：{summary.get('min_score', '-')}")
     st.caption(f"最大保存件数：{summary.get('max_count', '-')}")
+    st.caption(f"latest_signals件数：{summary.get('latest_signals_count', 0)}")
     st.caption(f"最終自動保存時刻：{summary.get('last_auto_save_at', '-')}")
     st.caption(f"次回実行予定：{summary.get('next_run_hint', '-')}")
+    st.caption(f"DBパス：{summary.get('db_path', VIRTUAL_TRADES_DB_PATH)}")
 
     cols = st.columns(5)
     cols[0].metric("対象候補数", summary.get("target_count", 0))
@@ -1722,6 +1727,54 @@ def _render_rule_auto_log_fragment() -> None:
     _fragment()
 
 
+def _run_rule_auto_log_test_once() -> Dict[str, Any]:
+    signals = list(st.session_state.get("latest_signals", []))
+    target_mode = str(st.session_state.get("ai_auto_target_mode", "buy_only"))
+    min_score = int(st.session_state.get("ai_auto_min_score", 70) or 70)
+    max_count = int(st.session_state.get("gpt_max_candidates", 3) or 3)
+    if not signals:
+        summary = {
+            "timestamp_jst": now_jst_display(),
+            "market_status": market_status_label(_auto_market_now()),
+            "input_signals_count": 0,
+            "selected_count": 0,
+            "saved_count": 0,
+            "duplicate_count": 0,
+            "failed_count": 0,
+            "results": [],
+            "error": "まだ株価スキャン結果がありません。先に株価スキャンを実行してください",
+            "db_path": str(VIRTUAL_TRADES_DB_PATH),
+            "openai_api_enabled": False,
+            "use_openai": False,
+        }
+        st.session_state["ai_rule_auto_test_summary"] = summary
+        st.session_state["ai_rule_auto_last_error"] = summary["error"]
+        return summary
+
+    summary = run_rule_based_virtual_logging(signals, target_mode, min_score, max_count)
+    st.session_state["ai_rule_auto_test_summary"] = summary
+    st.session_state["ai_rule_auto_last_results"] = summary.get("results", [])
+    st.session_state["last_ai_virtual_results"] = summary.get("results", [])
+    st.session_state["ai_rule_auto_last_error"] = summary.get("error", "")
+    _refresh_ai_virtual_db_debug_state()
+    return summary
+
+
+def _render_rule_auto_log_test_result() -> None:
+    summary = st.session_state.get("ai_rule_auto_test_summary")
+    if not summary:
+        return
+    if summary.get("error"):
+        st.warning(summary["error"])
+    st.caption(f"保存テスト時刻：{summary.get('timestamp_jst', '-')}")
+    st.caption(f"DBパス：{summary.get('db_path', '-')}")
+    cols = st.columns(4)
+    cols[0].metric("対象候補", summary.get("selected_count", 0))
+    cols[1].metric("保存成功", summary.get("saved_count", 0))
+    cols[2].metric("duplicate", summary.get("duplicate_count", 0))
+    cols[3].metric("保存失敗", summary.get("failed_count", 0))
+
+
 def _render_rule_auto_logger_section() -> None:
     st.markdown("**相場中ルール買いログ自動保存**")
     st.caption("画面を開いている間だけ、市場時間中にルールベースのpaper tradingログを保存します。実売買・発注は行いません。")
@@ -1754,6 +1807,9 @@ def _render_rule_auto_logger_section() -> None:
 
     st.caption(f"OpenAI API使用：{'ON' if _openai_api_enabled() else 'OFF'}")
     st.caption("自動保存は安全運用のため常に rule_based_fallback で実行します。OpenAI APIは呼びません。")
+    if st.button("ルール買いログを1回だけ保存テスト", key="run_rule_buy_log_once_test_button"):
+        _run_rule_auto_log_test_once()
+    _render_rule_auto_log_test_result()
     _render_rule_auto_log_fragment()
 
 

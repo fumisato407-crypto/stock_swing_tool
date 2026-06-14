@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List
 
 from ai_judge import build_market_snapshot, judge_virtual_trade
@@ -84,11 +85,16 @@ def build_virtual_trade_record(
     }
 
 
-def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = False) -> Dict[str, Any]:
+def process_virtual_trade_signal(
+    signal: Dict[str, Any],
+    use_openai: bool = False,
+    db_path: Path | None = None,
+) -> Dict[str, Any]:
     snapshot = build_market_snapshot(signal)
     decision = judge_virtual_trade(signal, use_openai=use_openai)
     record = build_virtual_trade_record(signal, decision, snapshot)
-    db_path = str(VIRTUAL_TRADES_DB_PATH)
+    target_db_path = db_path or VIRTUAL_TRADES_DB_PATH
+    db_path_text = str(target_db_path)
 
     if not record["symbol"]:
         return {
@@ -96,7 +102,7 @@ def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = Fals
             "reason": "symbol_missing",
             "decision": decision,
             "record": record,
-            "db_path": db_path,
+            "db_path": db_path_text,
         }
 
     duplicate = find_recent_virtual_trade(
@@ -104,6 +110,7 @@ def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = Fals
         entry_type=record["entry_type"],
         judge_source=record["judge_source"],
         minutes=DUPLICATE_COOLDOWN_MINUTES,
+        path=target_db_path,
     )
     if duplicate:
         return {
@@ -112,25 +119,29 @@ def process_virtual_trade_signal(signal: Dict[str, Any], use_openai: bool = Fals
             "duplicate_id": duplicate.get("id"),
             "decision": decision,
             "record": record,
-            "db_path": db_path,
+            "db_path": db_path_text,
         }
 
-    trade_id = insert_virtual_trade(record)
+    trade_id = insert_virtual_trade(record, path=target_db_path)
     return {
         "saved": True,
         "reason": "saved",
         "trade_id": trade_id,
-        "db_path": db_path,
+        "db_path": db_path_text,
         "decision": decision,
         "record": record,
     }
 
 
-def process_virtual_trade_signals(signals: List[Dict[str, Any]], use_openai: bool = False) -> List[Dict[str, Any]]:
+def process_virtual_trade_signals(
+    signals: List[Dict[str, Any]],
+    use_openai: bool = False,
+    db_path: Path | None = None,
+) -> List[Dict[str, Any]]:
     results = []
     for signal in signals:
         try:
-            results.append(process_virtual_trade_signal(signal, use_openai=use_openai))
+            results.append(process_virtual_trade_signal(signal, use_openai=use_openai, db_path=db_path))
         except Exception as exc:
             results.append(
                 {
@@ -139,7 +150,7 @@ def process_virtual_trade_signals(signals: List[Dict[str, Any]], use_openai: boo
                     "error_message": str(exc),
                     "decision": {},
                     "record": {"code": signal.get("code"), "name": signal.get("name")},
-                    "db_path": str(VIRTUAL_TRADES_DB_PATH),
+                    "db_path": str(db_path or VIRTUAL_TRADES_DB_PATH),
                 }
             )
     return results

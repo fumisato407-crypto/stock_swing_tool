@@ -12,6 +12,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 streamlit*.log
+logs/
 alerts_log.csv
 virtual_trades.db
 virtual_trades.db-*

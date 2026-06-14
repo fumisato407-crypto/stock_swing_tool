@@ -427,7 +427,47 @@ OpenAI API:
 - 同一銘柄、同一entry_type、同一judge_sourceの短時間重複保存は30分抑制します。
 - これは実売買・自動売買・発注ではありません。検証用のpaper tradingです。
 - `trades.csv`とは混ぜません。AI仮想取引ログは`virtual_trades.db`に保存します。
-- Streamlit Cloud上のSQLiteは永続保存に向きません。本命の長時間運用は、将来的に`market_runner.py`でローカルPC常駐にする想定です。
+- Streamlit Cloud上のSQLiteは永続保存に向きません。本命の長時間運用は、ローカルPC常駐の`market_runner.py`を使います。
+- 平日場中を待たずにCloud上で確認したい場合は、`ルール買いログを1回だけ保存テスト`を押します。市場時間判定を無視して1回だけ同じ保存ロジックを実行します。
+
+ローカル常駐の自動収集:
+
+- 本命運用はローカルPCで`market_runner.py`を動かし、`virtual_trades.db`を継続的に育てる形です。
+- Streamlit Cloudの自動保存は、画面を開いている間だけ動く簡易自動実行です。Cloud上のSQLiteは再起動や再デプロイで消える可能性があるため、本命保存先にしないでください。
+- `market_runner.py`も実売買・自動売買・発注ではありません。paper tradingログを`virtual_trades.db`へ保存するだけです。
+- OpenAI API使用はOFF固定の運用です。APIキーがあっても`--use-openai off`でAPI料金は発生しません。
+- 市場時間外、昼休み、土日は自動待機します。終了するときはターミナルで`Ctrl+C`を押します。
+
+起動例:
+
+```bash
+python market_runner.py --interval-minutes 5 --target buy --min-score 70 --max-candidates 3
+```
+
+1回だけ動作確認:
+
+```bash
+python market_runner.py --once --force-market-open --dry-run
+python market_runner.py --once --force-market-open
+```
+
+Windows用bat:
+
+```bat
+run_market_runner.bat
+```
+
+`run_market_runner.bat`はプロジェクトフォルダへ移動し、`.venv`があれば有効化して、5分間隔で`market_runner.py`を起動します。処理ログは`logs/market_runner.log`に残ります。
+
+Windowsタスクスケジューラの例:
+
+1. タスクスケジューラを開きます。
+2. `基本タスクの作成`を選びます。
+3. 名前を`stock_swing_tool market runner`などにします。
+4. トリガーを`毎週`にし、月曜から金曜の8:55に設定します。
+5. 操作は`プログラムの開始`を選びます。
+6. プログラムに`C:\Users\fumi\Documents\New project\stock_swing_tool\run_market_runner.bat`を指定します。
+7. 実行後は市場時間外なら待機し、市場時間中だけスキャンとpaper tradingログ保存を行います。
 
 成績表示:
 
