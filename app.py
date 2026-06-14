@@ -31,7 +31,7 @@ from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
 from pattern_stats import calculate_pattern_stats
-from replay_engine import run_replay
+from replay_engine import apply_replay_money_metrics, run_replay, summarize_replay_money
 from replay_store import insert_replay_trades, load_replay_trades
 from scanner import (
     append_trade_candidate,
@@ -1268,6 +1268,19 @@ def _format_pct_value(value: Any) -> str:
     return f"{number:+.1f}%"
 
 
+def _format_signed_yen(value: Any) -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return "-"
+        return f"{float(value):+,.0f}円"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _format_plain_yen(value: Any) -> str:
+    return format_yen(value)
+
+
 def _format_elapsed_days(value: Any) -> str:
     parsed = parse_trade_datetime_to_jst_naive(value)
     if parsed is None:
@@ -2200,9 +2213,18 @@ def _display_replay_outcome(value: Any) -> str:
     }.get(str(value or ""), str(value or "-"))
 
 
-def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
+def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None) -> pd.DataFrame:
+    default_shares = 100
+    if shares:
+        default_shares = int(shares)
+    elif trades:
+        try:
+            default_shares = int(trades[0].get("shares") or 100)
+        except (TypeError, ValueError):
+            default_shares = 100
+    display_trades = apply_replay_money_metrics(trades, default_shares)
     rows = []
-    for trade in trades:
+    for trade in display_trades:
         symbol = str(trade.get("symbol", "") or "")
         name = str(trade.get("name", "") or "")
         rows.append(
@@ -2211,12 +2233,16 @@ def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
                 "銘柄": f"{symbol} {name}".strip() or "-",
                 "型": trade.get("entry_type", "-"),
                 "買値": format_yen(trade.get("entry_price")),
+                "株数": f"{trade.get('shares', shares or 100)}株",
+                "必要資金": _format_plain_yen(trade.get("required_capital_yen")),
                 "損切り": format_yen(trade.get("stop_loss")),
                 "利確目標": format_yen(trade.get("take_profit")),
                 "スコア": _format_score_value(trade.get("score")),
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
+                "損益円": _format_signed_yen(trade.get("profit_yen")),
+                "累計損益": _format_signed_yen(trade.get("cumulative_profit_yen")),
                 "リターン": _format_pct_value(trade.get("return_pct")),
                 "最大利益率": _format_pct_value(trade.get("max_profit_pct")),
                 "最大下落率": _format_pct_value(trade.get("max_drawdown_pct")),
@@ -2231,12 +2257,16 @@ def _replay_result_table(trades: List[Dict[str, Any]]) -> pd.DataFrame:
             "銘柄",
             "型",
             "買値",
+            "株数",
+            "必要資金",
             "損切り",
             "利確目標",
             "スコア",
             "結果",
             "終了時刻",
             "終了価格",
+            "損益円",
+            "累計損益",
             "リターン",
             "最大利益率",
             "最大下落率",
@@ -2325,6 +2355,70 @@ def _render_replay_summary(summary: Dict[str, Any], saved_count: int) -> None:
     cols[2].metric("損切り到達", summary.get("hit_stop_loss_count", 0))
     cols[3].metric("利確到達", summary.get("hit_take_profit_count", 0))
     cols[4].metric("検証データ", f"{summary.get('data_rows', 0)}本")
+
+
+def _format_profit_loss_ratio(value: Any) -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return "-"
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _render_replay_money_summary(money_summary: Dict[str, Any]) -> None:
+    st.markdown("**想定株数ベース損益**")
+    cols = st.columns(5)
+    cols[0].metric("想定株数", f"{money_summary.get('shares', 100)}株")
+    cols[1].metric("必要資金平均", _format_plain_yen(money_summary.get("average_required_capital_yen")))
+    cols[2].metric("累計利益", _format_signed_yen(money_summary.get("gross_profit_yen")))
+    cols[3].metric("累計損失", _format_signed_yen(money_summary.get("gross_loss_yen")))
+    cols[4].metric("純損益", _format_signed_yen(money_summary.get("net_profit_yen")))
+
+    cols = st.columns(5)
+    cols[0].metric("損益比", _format_profit_loss_ratio(money_summary.get("profit_loss_ratio")))
+    cols[1].metric("平均利益", _format_signed_yen(money_summary.get("average_profit_yen")))
+    cols[2].metric("平均損失", _format_signed_yen(money_summary.get("average_loss_yen")))
+    cols[3].metric("最大利益", _format_signed_yen(money_summary.get("max_profit_yen")))
+    cols[4].metric("最大損失", _format_signed_yen(money_summary.get("max_loss_yen")))
+
+    cols = st.columns(3)
+    cols[0].metric("確定損益対象", f"{money_summary.get('closed_trade_count', 0)}件")
+    cols[1].metric("最大連勝数", money_summary.get("max_win_streak", 0))
+    cols[2].metric("最大連敗数", money_summary.get("max_loss_streak", 0))
+
+
+def _render_replay_profit_curve(trades: List[Dict[str, Any]], shares: int) -> None:
+    prepared = apply_replay_money_metrics(trades, shares)
+    rows = [
+        {
+            "仮想買い時刻": pd.Timestamp(trade.get("signal_time")),
+            "累計損益円": trade.get("cumulative_profit_yen"),
+        }
+        for trade in prepared
+        if trade.get("cumulative_profit_yen") is not None
+    ]
+    if not rows:
+        return
+    curve = pd.DataFrame(rows).sort_values("仮想買い時刻")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=curve["仮想買い時刻"],
+            y=curve["累計損益円"],
+            mode="lines+markers",
+            name="累計損益",
+            line={"color": "#0f766e", "width": 2},
+            marker={"size": 7},
+        )
+    )
+    fig.update_layout(
+        height=300,
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        yaxis_title="円",
+        xaxis_title="",
+    )
+    _render_plotly_chart(fig, key="replay_profit_curve")
 
 
 def _render_replay_chart(df: pd.DataFrame, trades: List[Dict[str, Any]]) -> None:
@@ -2462,11 +2556,12 @@ def _render_historical_replay_tab() -> None:
     end_date = range_cols[2].date_input("終了日", value=last_dt.date(), key="replay_end_date")
     end_time = range_cols[3].time_input("終了時刻", value=last_dt.time().replace(second=0, microsecond=0), key="replay_end_time")
 
-    rule_cols = st.columns(4)
+    rule_cols = st.columns(5)
     min_score = rule_cols[0].selectbox("最小スコア", [60, 70, 75, 80], index=1, key="replay_min_score")
     target_rule_label = rule_cols[1].selectbox("対象ルール", REPLAY_RULE_OPTIONS, index=0, key="replay_target_rule")
     max_trades = rule_cols[2].selectbox("最大仮想買い件数", [1, 3, 5, 10, 20, 50], index=3, key="replay_max_trades")
     cooldown_bars = rule_cols[3].selectbox("連続シグナル抑制", [3, 6, 12, 24], index=2, key="replay_cooldown_bars")
+    replay_shares = int(rule_cols[4].selectbox("想定株数", [100, 200, 300, 500, 1000], index=0, key="replay_shares"))
 
     start_at = _combine_date_time(start_date, start_time)
     end_at = _combine_date_time(end_date, end_time)
@@ -2491,22 +2586,29 @@ def _render_historical_replay_tab() -> None:
                     "debug": True,
                 },
             )
+            result["trades"] = apply_replay_money_metrics(result["trades"], replay_shares)
+            result["money_summary"] = summarize_replay_money(result["trades"], replay_shares)
             store_result = insert_replay_trades(result["trades"])
         st.session_state["replay_last_result"] = result
         st.session_state["replay_last_store_result"] = store_result
+        st.session_state["replay_last_shares"] = replay_shares
         st.success(f"リプレイ検証を完了しました。仮想買い {len(result['trades'])}件 / DB保存 {store_result['saved_count']}件")
 
     last_result = st.session_state.get("replay_last_result", {})
     last_store = st.session_state.get("replay_last_store_result", {})
     if last_result:
         summary = last_result.get("summary", {})
-        trades = last_result.get("trades", [])
+        display_shares = int(st.session_state.get("replay_last_shares", replay_shares))
+        trades = apply_replay_money_metrics(last_result.get("trades", []), display_shares)
+        money_summary = summarize_replay_money(trades, display_shares)
         _render_replay_summary(summary, int(last_store.get("saved_count", 0)))
+        _render_replay_money_summary(money_summary)
         _replay_extreme_result_warnings(trades)
+        _render_replay_profit_curve(trades, display_shares)
         _render_replay_chart(replay_data, trades)
         st.markdown("**リプレイ結果表**")
         if trades:
-            st.dataframe(_safe_dataframe(_replay_result_table(trades)), width="stretch", hide_index=True)
+            st.dataframe(_safe_dataframe(_replay_result_table(trades, display_shares)), width="stretch", hide_index=True)
         else:
             st.info("条件に一致する仮想買いポイントはありませんでした。")
 

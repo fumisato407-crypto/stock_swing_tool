@@ -31,6 +31,10 @@ REPLAY_COLUMNS = [
     "status",
     "outcome",
     "exit_price",
+    "shares",
+    "required_capital_yen",
+    "profit_yen",
+    "cumulative_profit_yen",
     "return_pct",
     "max_profit_pct",
     "max_drawdown_pct",
@@ -70,6 +74,10 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
                 status TEXT,
                 outcome TEXT,
                 exit_price REAL,
+                shares INTEGER,
+                required_capital_yen REAL,
+                profit_yen REAL,
+                cumulative_profit_yen REAL,
                 return_pct REAL,
                 max_profit_pct REAL,
                 max_drawdown_pct REAL,
@@ -88,6 +96,10 @@ def ensure_replay_store(path: Path = REPLAY_TRADES_DB_PATH) -> None:
             "exit_reason": "TEXT",
             "notes_json": "TEXT",
             "exit_price": "REAL",
+            "shares": "INTEGER",
+            "required_capital_yen": "REAL",
+            "profit_yen": "REAL",
+            "cumulative_profit_yen": "REAL",
         }
         for column, column_type in migrations.items():
             if column not in existing:
@@ -122,6 +134,10 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
         "status": str(record.get("status", "")),
         "outcome": str(record.get("outcome", "")),
         "exit_price": record.get("exit_price"),
+        "shares": record.get("shares"),
+        "required_capital_yen": record.get("required_capital_yen"),
+        "profit_yen": record.get("profit_yen"),
+        "cumulative_profit_yen": record.get("cumulative_profit_yen"),
         "return_pct": record.get("return_pct"),
         "max_profit_pct": record.get("max_profit_pct"),
         "max_drawdown_pct": record.get("max_drawdown_pct"),
@@ -138,12 +154,14 @@ def insert_replay_trade(record: Dict[str, Any], path: Path = REPLAY_TRADES_DB_PA
             INSERT INTO replay_trades (
                 replay_run_id, created_at_jst, symbol, name, replay_start_at, replay_end_at,
                 signal_time, entry_price, stop_loss, take_profit, score, entry_type, rule_name,
-                status, outcome, exit_price, return_pct, max_profit_pct, max_drawdown_pct,
+                status, outcome, exit_price, shares, required_capital_yen, profit_yen, cumulative_profit_yen,
+                return_pct, max_profit_pct, max_drawdown_pct,
                 hit_stop_loss, hit_take_profit, evaluated_until, holding_period, exit_reason, notes_json
             ) VALUES (
                 :replay_run_id, :created_at_jst, :symbol, :name, :replay_start_at, :replay_end_at,
                 :signal_time, :entry_price, :stop_loss, :take_profit, :score, :entry_type, :rule_name,
-                :status, :outcome, :exit_price, :return_pct, :max_profit_pct, :max_drawdown_pct,
+                :status, :outcome, :exit_price, :shares, :required_capital_yen, :profit_yen, :cumulative_profit_yen,
+                :return_pct, :max_profit_pct, :max_drawdown_pct,
                 :hit_stop_loss, :hit_take_profit, :evaluated_until, :holding_period, :exit_reason, :notes_json
             )
             """,

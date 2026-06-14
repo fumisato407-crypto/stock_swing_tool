@@ -15,6 +15,7 @@ INTERVAL_MAX_HOLD_BARS = {
     "1h": 30,
     "1d": 5,
 }
+DEFAULT_REPLAY_SHARES = 100
 
 
 @dataclass
@@ -367,4 +368,92 @@ def summarize_replay_results(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_max_drawdown_pct": avg_drawdown,
         "hit_stop_loss_count": sum(1 for trade in trades if trade.get("hit_stop_loss")),
         "hit_take_profit_count": sum(1 for trade in trades if trade.get("hit_take_profit")),
+    }
+
+
+def _trade_sort_key(trade: Dict[str, Any]) -> pd.Timestamp:
+    try:
+        return pd.Timestamp(trade.get("signal_time"))
+    except Exception:
+        return pd.Timestamp.max
+
+
+def _is_closed_money_trade(trade: Dict[str, Any]) -> bool:
+    if str(trade.get("status", "")) != "closed":
+        return False
+    return trade.get("entry_price") is not None and trade.get("exit_price") is not None
+
+
+def apply_replay_money_metrics(
+    trades: List[Dict[str, Any]],
+    shares: int = DEFAULT_REPLAY_SHARES,
+) -> List[Dict[str, Any]]:
+    share_count = int(shares or DEFAULT_REPLAY_SHARES)
+    cumulative = 0.0
+    rows: List[Dict[str, Any]] = []
+    for trade in sorted([dict(item) for item in trades], key=_trade_sort_key):
+        entry_price = _num(trade.get("entry_price"), 0)
+        exit_price = _num(trade.get("exit_price"), 0)
+        required_capital = entry_price * share_count if entry_price else None
+        profit_yen = None
+        cumulative_profit = None
+        if _is_closed_money_trade(trade) and entry_price and exit_price:
+            profit_yen = round((exit_price - entry_price) * share_count)
+            cumulative += profit_yen
+            cumulative_profit = round(cumulative)
+        trade["shares"] = share_count
+        trade["required_capital_yen"] = round(required_capital) if required_capital is not None else None
+        trade["profit_yen"] = profit_yen
+        trade["cumulative_profit_yen"] = cumulative_profit
+        rows.append(trade)
+    return rows
+
+
+def _max_streak(values: List[float], positive: bool) -> int:
+    best = 0
+    current = 0
+    for value in values:
+        is_hit = value > 0 if positive else value < 0
+        if is_hit:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
+
+
+def summarize_replay_money(
+    trades: List[Dict[str, Any]],
+    shares: int = DEFAULT_REPLAY_SHARES,
+) -> Dict[str, Any]:
+    prepared = apply_replay_money_metrics(trades, shares)
+    closed = [trade for trade in prepared if trade.get("profit_yen") is not None]
+    profits = [float(trade["profit_yen"]) for trade in closed]
+    wins = [value for value in profits if value > 0]
+    losses = [value for value in profits if value < 0]
+    required_capitals = [
+        float(trade["required_capital_yen"])
+        for trade in closed
+        if trade.get("required_capital_yen") is not None
+    ]
+    avg_profit = sum(wins) / len(wins) if wins else None
+    avg_loss = sum(losses) / len(losses) if losses else None
+    profit_loss_ratio = None
+    if avg_profit is not None and avg_loss not in (None, 0):
+        profit_loss_ratio = round(avg_profit / abs(avg_loss), 2)
+
+    return {
+        "shares": int(shares or DEFAULT_REPLAY_SHARES),
+        "closed_trade_count": len(closed),
+        "average_required_capital_yen": round(sum(required_capitals) / len(required_capitals)) if required_capitals else None,
+        "gross_profit_yen": round(sum(wins)) if wins else 0,
+        "gross_loss_yen": round(sum(losses)) if losses else 0,
+        "net_profit_yen": round(sum(profits)) if profits else 0,
+        "profit_loss_ratio": profit_loss_ratio,
+        "average_profit_yen": round(avg_profit) if avg_profit is not None else None,
+        "average_loss_yen": round(avg_loss) if avg_loss is not None else None,
+        "max_profit_yen": round(max(profits)) if profits else None,
+        "max_loss_yen": round(min(profits)) if profits else None,
+        "max_win_streak": _max_streak(profits, positive=True),
+        "max_loss_streak": _max_streak(profits, positive=False),
     }

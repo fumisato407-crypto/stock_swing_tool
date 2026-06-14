@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from replay_engine import evaluate_replay_trade_outcome
+from replay_engine import apply_replay_money_metrics, evaluate_replay_trade_outcome, summarize_replay_money
 
 
 def _future_df(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
@@ -73,6 +73,57 @@ class ReplayOutcomeTest(unittest.TestCase):
         result = evaluate_replay_trade_outcome(trade, future, interval="1d")
 
         self.assertEqual(result["max_drawdown_pct"], -2.0)
+
+    def test_profit_yen_for_100_shares(self) -> None:
+        trades = [
+            {
+                "signal_time": "2026-01-01 09:00",
+                "status": "closed",
+                "entry_price": 7872,
+                "exit_price": 7900,
+            },
+            {
+                "signal_time": "2026-01-01 09:05",
+                "status": "closed",
+                "entry_price": 7802,
+                "exit_price": 7800,
+            },
+        ]
+
+        prepared = apply_replay_money_metrics(trades, shares=100)
+        summary = summarize_replay_money(trades, shares=100)
+
+        self.assertEqual(prepared[0]["profit_yen"], 2800)
+        self.assertEqual(prepared[1]["profit_yen"], -200)
+        self.assertEqual(prepared[0]["required_capital_yen"], 787200)
+        self.assertEqual(prepared[1]["cumulative_profit_yen"], 2600)
+        self.assertEqual(summary["gross_profit_yen"], 2800)
+        self.assertEqual(summary["gross_loss_yen"], -200)
+        self.assertEqual(summary["net_profit_yen"], 2600)
+        self.assertEqual(summary["profit_loss_ratio"], 14.0)
+
+    def test_open_trade_is_excluded_from_confirmed_profit(self) -> None:
+        trades = [
+            {
+                "signal_time": "2026-01-01 09:00",
+                "status": "open",
+                "entry_price": 100,
+                "exit_price": None,
+            },
+            {
+                "signal_time": "2026-01-01 09:05",
+                "status": "closed",
+                "entry_price": 100,
+                "exit_price": 98,
+            },
+        ]
+
+        prepared = apply_replay_money_metrics(trades, shares=100)
+        summary = summarize_replay_money(trades, shares=100)
+
+        self.assertIsNone(prepared[0]["profit_yen"])
+        self.assertEqual(summary["closed_trade_count"], 1)
+        self.assertEqual(summary["net_profit_yen"], -200)
 
 
 if __name__ == "__main__":
