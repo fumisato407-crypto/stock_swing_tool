@@ -5,9 +5,11 @@ import unittest
 import pandas as pd
 
 from replay_engine import (
+    CANDIDATE_MODE_TECHNICAL_ONLY,
     apply_replay_money_metrics,
     create_replay_trade,
     evaluate_replay_trade_outcome,
+    run_replay,
     summarize_replay_money,
 )
 
@@ -22,6 +24,36 @@ def _future_df(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFra
             "Volume": [1000 for _ in rows],
         },
         index=pd.to_datetime([row[0] for row in rows]),
+    )
+
+
+def _technical_daily_df() -> pd.DataFrame:
+    index = pd.date_range("2026-01-01", periods=130, freq="D")
+    close = [100 + idx * 0.35 for idx in range(len(index))]
+    return pd.DataFrame(
+        {
+            "Open": [value - 0.4 for value in close],
+            "High": [value + 1.2 for value in close],
+            "Low": [value - 1.2 for value in close],
+            "Close": close,
+            "Volume": [5_000_000 + idx * 1000 for idx in range(len(index))],
+        },
+        index=index,
+    )
+
+
+def _technical_intraday_df() -> pd.DataFrame:
+    index = pd.date_range("2026-05-11 09:00", periods=80, freq="5min")
+    close = [145 + idx * 0.08 for idx in range(len(index))]
+    return pd.DataFrame(
+        {
+            "Open": [value - 0.1 for value in close],
+            "High": [value + 0.5 for value in close],
+            "Low": [value - 0.5 for value in close],
+            "Close": close,
+            "Volume": [800_000 + idx * 500 for idx in range(len(index))],
+        },
+        index=index,
     )
 
 
@@ -190,6 +222,31 @@ class ReplayOutcomeTest(unittest.TestCase):
         self.assertEqual(result["exit_time"], "2026-01-01 09:10")
         self.assertEqual(result["exit_price"], 104)
 
+    def test_create_replay_trade_preserves_technical_fields(self) -> None:
+        signal = {
+            "current_price": 100,
+            "stop_loss": 97,
+            "take_profit_1": 104,
+            "intraday_score": 75,
+            "signal_type": "ブレイク狙い",
+            "technical_preset": "standard_swing",
+            "technical_score_raw": 44,
+            "technical_penalty_score": -3,
+            "technical_score_final": 41,
+            "technical_judgement": "条件付き買い",
+            "technical_confidence": 90,
+            "technical_score_breakdown": {"trend": ["25日線より上 +4"]},
+            "technical_penalty_reasons": ["長い上ヒゲ -5"],
+            "technical_hard_filter_reason": [],
+        }
+        current_bar = pd.Series({"Close": 100})
+
+        trade = create_replay_trade(signal, current_bar, "2026-01-01 09:00")
+
+        self.assertEqual(trade["technical_preset"], "standard_swing")
+        self.assertEqual(trade["technical_score_final"], 41)
+        self.assertEqual(trade["technical_score_breakdown"]["trend"], ["25日線より上 +4"])
+
     def test_profit_yen_for_100_shares(self) -> None:
         trades = [
             {
@@ -240,6 +297,41 @@ class ReplayOutcomeTest(unittest.TestCase):
         self.assertIsNone(prepared[0]["profit_yen"])
         self.assertEqual(summary["closed_trade_count"], 1)
         self.assertEqual(summary["net_profit_yen"], -200)
+
+    def test_technical_only_mode_bypasses_existing_score_and_creates_trade(self) -> None:
+        result = run_replay(
+            symbol="5803.T",
+            name="テスト",
+            df=_technical_intraday_df(),
+            daily_df=_technical_daily_df(),
+            rule_config={
+                "candidate_generation_mode": CANDIDATE_MODE_TECHNICAL_ONLY,
+                "min_score": 999,
+                "max_trades": 2,
+                "cooldown_bars": 6,
+                "interval": "5m",
+                "use_technical_score": True,
+                "technical_min_score": 0,
+                "technical_config": {
+                    "preset_name": "standard_swing",
+                    "use_trend": True,
+                    "use_entry_position": True,
+                    "use_volume": True,
+                    "use_candle": True,
+                    "use_breakout": True,
+                    "use_momentum": True,
+                    "use_risk_reward": True,
+                    "use_penalty": True,
+                    "use_hard_filter": False,
+                },
+            },
+        )
+
+        self.assertGreater(len(result["trades"]), 0)
+        self.assertEqual(result["trades"][0]["rule_name"], "technical_only_replay_rule")
+        self.assertEqual(result["trades"][0]["candidate_generation_mode"], CANDIDATE_MODE_TECHNICAL_ONLY)
+        self.assertGreater(result["summary"]["stage_counts"]["technical_score_attempt_count"], 0)
+        self.assertEqual(result["summary"]["stage_counts"]["final_virtual_buy_count"], len(result["trades"]))
 
 
 if __name__ == "__main__":

@@ -301,3 +301,16 @@ def load_or_fetch_historical_data(symbol: object, period: str, interval: str) ->
                 from_cache=True,
             )
     return fetch_historical_data(symbol, period, interval)
+
+
+def clear_historical_cache() -> dict:
+    DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    deleted = 0
+    errors: list[str] = []
+    for path in DATA_CACHE_DIR.glob("*.csv"):
+        try:
+            path.unlink()
+            deleted += 1
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc.__class__.__name__}")
+    return {"deleted_files": deleted, "errors": errors}

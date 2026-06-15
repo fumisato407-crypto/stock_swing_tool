@@ -24,15 +24,39 @@ from config import (
     get_setting,
 )
 from data_fetcher import fetch_price_data, normalize_jp_symbol
-from historical_scan_replay import HistoricalScanReplayConfig, run_historical_scan_replay
-from historical_data import HistoricalDataResult, YFINANCE_AUTO_ADJUST, load_or_fetch_historical_data, validate_historical_ohlcv
+from daily_technical import (
+    DEFAULT_DAILY_FETCH_PERIOD,
+    MIN_DAILY_HISTORY_ROWS,
+    fetch_daily_technical_data,
+    get_technical_config_for_preset,
+    get_technical_preset_options,
+    score_daily_technical_data,
+)
+from historical_scan_replay import HistoricalScanReplayConfig, attach_watchlist_replay_exports, run_historical_scan_replay
+from historical_data import HistoricalDataResult, YFINANCE_AUTO_ADJUST, clear_historical_cache, load_or_fetch_historical_data, validate_historical_ohlcv
 from intraday_scanner import fetch_intraday_data, run_raw_intraday_fetch_test, scan_intraday_entries
 from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
 from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
 from paper_trader import process_virtual_trade_signals
 from pattern_stats import calculate_pattern_stats
-from replay_engine import apply_replay_money_metrics, run_replay, summarize_replay_money, summarize_replay_results
+from replay_batch import (
+    BatchReplayConfig,
+    ConditionVariant,
+    build_condition_variants,
+    run_multi_symbol_replay_comparison,
+)
+from replay_cache import clear_replay_cache, replay_cache_stats
+from replay_engine import (
+    CANDIDATE_MODE_EXISTING,
+    CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+    CANDIDATE_MODE_LABELS,
+    CANDIDATE_MODE_TECHNICAL_ONLY,
+    apply_replay_money_metrics,
+    run_replay,
+    summarize_replay_money,
+    summarize_replay_results,
+)
 from replay_store import insert_replay_run, insert_replay_trades, load_replay_trades
 from scanner import (
     append_trade_candidate,
@@ -2984,6 +3008,7 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             {
                 "仮想買い時刻": trade.get("signal_time", "-"),
                 "銘柄": f"{symbol} {name}".strip() or "-",
+                "条件": trade.get("condition_name", "-"),
                 "型": trade.get("entry_type", "-"),
                 "買値": format_yen(trade.get("entry_price")),
                 "株数": f"{trade.get('shares', shares or 100)}株",
@@ -3007,6 +3032,21 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
                 "リスク判定": _display_risk_pass(trade.get("risk_pass")),
                 "リスク除外理由": _risk_reason_text(trade),
                 "買い条件": _buy_condition_text(trade),
+                "テクニカルプリセット": trade.get("technical_preset", "-"),
+                "テクニカル素点": _format_score_value(trade.get("technical_score_raw")),
+                "テクニカル減点": _format_score_value(trade.get("technical_penalty_score")),
+                "テクニカル最終": _format_score_value(trade.get("technical_score_final")),
+                "テクニカル判定": trade.get("technical_judgement", "-"),
+                "確度": f"{trade.get('technical_confidence')}%" if trade.get("technical_confidence") not in (None, "") else "-",
+                "score_breakdown": _technical_breakdown_text(trade.get("technical_score_breakdown")),
+                "技術損切り": format_yen(trade.get("technical_stop_loss_candidate")),
+                "技術利確": format_yen(trade.get("technical_target_price_candidate")),
+                "技術R/R": _format_profit_loss_ratio(trade.get("technical_risk_reward")),
+                "技術減点理由": _join_reason_text(trade.get("technical_penalty_reasons")),
+                "技術見送り理由": _join_reason_text(trade.get("technical_hard_filter_reason")),
+                "不足データ": _join_reason_text(trade.get("technical_missing_data")),
+                "リーク検査": trade.get("leak_check_result", "-"),
+                "cache": "hit" if trade.get("technical_cache_hit") else "miss",
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -3024,6 +3064,7 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
         columns=[
             "仮想買い時刻",
             "銘柄",
+            "条件",
             "型",
             "買値",
             "株数",
@@ -3043,6 +3084,21 @@ def _replay_result_table(trades: List[Dict[str, Any]], shares: int | None = None
             "リスク判定",
             "リスク除外理由",
             "買い条件",
+            "テクニカルプリセット",
+            "テクニカル素点",
+            "テクニカル減点",
+            "テクニカル最終",
+            "テクニカル判定",
+            "確度",
+            "score_breakdown",
+            "技術損切り",
+            "技術利確",
+            "技術R/R",
+            "技術減点理由",
+            "技術見送り理由",
+            "不足データ",
+            "リーク検査",
+            "cache",
             "結果",
             "終了時刻",
             "終了価格",
@@ -3074,6 +3130,7 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "スキャン時刻": trade.get("scan_time", "-"),
                 "仮想買い時刻": trade.get("signal_time", "-"),
                 "銘柄": f"{symbol} {name}".strip() or "-",
+                "条件": trade.get("condition_name", "-"),
                 "順位": trade.get("selected_rank", "-"),
                 "型": trade.get("entry_type", "-"),
                 "買値": format_yen(trade.get("entry_price")),
@@ -3095,6 +3152,16 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
                 "損益比": _format_profit_loss_ratio(trade.get("risk_reward_ratio")),
                 "リスク判定": _display_risk_pass(trade.get("risk_pass")),
                 "買い条件": _buy_condition_text(trade),
+                "テクニカルプリセット": trade.get("technical_preset", "-"),
+                "テクニカル素点": _format_score_value(trade.get("technical_score_raw")),
+                "テクニカル減点": _format_score_value(trade.get("technical_penalty_score")),
+                "テクニカル最終": _format_score_value(trade.get("technical_score_final")),
+                "テクニカル判定": trade.get("technical_judgement", "-"),
+                "確度": f"{trade.get('technical_confidence')}%" if trade.get("technical_confidence") not in (None, "") else "-",
+                "score_breakdown": _technical_breakdown_text(trade.get("technical_score_breakdown")),
+                "技術R/R": _format_profit_loss_ratio(trade.get("technical_risk_reward")),
+                "リーク検査": trade.get("leak_check_result", "-"),
+                "cache": "hit" if trade.get("technical_cache_hit") else "miss",
                 "結果": _display_replay_outcome(trade.get("outcome")),
                 "終了時刻": trade.get("exit_time") or trade.get("evaluated_until", "-"),
                 "終了価格": format_yen(trade.get("exit_price")),
@@ -3110,6 +3177,7 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "スキャン時刻",
         "仮想買い時刻",
         "銘柄",
+        "条件",
         "順位",
         "型",
         "買値",
@@ -3127,6 +3195,16 @@ def _historical_scan_trade_table(trades: List[Dict[str, Any]], shares: int) -> p
         "損益比",
         "リスク判定",
         "買い条件",
+        "テクニカルプリセット",
+        "テクニカル素点",
+        "テクニカル減点",
+        "テクニカル最終",
+        "テクニカル判定",
+        "確度",
+        "score_breakdown",
+        "技術R/R",
+        "リーク検査",
+        "cache",
         "結果",
         "終了時刻",
         "終了価格",
@@ -3333,6 +3411,77 @@ def _render_risk_performance(trades: List[Dict[str, Any]], shares: int) -> None:
         st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "risk_pass_group", "リスク判定", shares)), width="stretch", hide_index=True)
         st.caption("最大損失額別")
         st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "max_loss_bucket", "最大損失", shares)), width="stretch", hide_index=True)
+
+
+def _technical_score_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未計算"
+    if number < 30:
+        return "30未満"
+    if number < 36:
+        return "30〜35"
+    if number < 42:
+        return "36〜41"
+    if number < 50:
+        return "42〜49"
+    return "50以上"
+
+
+def _breakdown_has(trade: Dict[str, Any], section: str, pattern: str) -> bool:
+    breakdown = trade.get("technical_score_breakdown")
+    if not isinstance(breakdown, dict):
+        return False
+    values = breakdown.get(section) or []
+    if isinstance(values, str):
+        values = [values]
+    return any(pattern in str(value) for value in values)
+
+
+def _render_technical_performance(trades: List[Dict[str, Any]], shares: int) -> None:
+    technical_trades = [trade for trade in trades if trade.get("technical_score_final") not in (None, "")]
+    if not technical_trades:
+        return
+    prepared = []
+    for trade in technical_trades:
+        row = dict(trade)
+        row["technical_score_bucket"] = _technical_score_bucket(row.get("technical_score_final"))
+        row["technical_preset_group"] = row.get("technical_preset") or "未設定"
+        row["technical_judgement_group"] = row.get("technical_judgement") or "未設定"
+        row["technical_25ma_group"] = "25日線上" if _breakdown_has(row, "trend", "25日線より上") else "25日線上なし"
+        breakdown = row.get("technical_score_breakdown") if isinstance(row.get("technical_score_breakdown"), dict) else {}
+        row["technical_volume_group"] = "出来高加点あり" if breakdown.get("volume") else "出来高加点なし"
+        row["technical_breakout_group"] = "ブレイク加点あり" if breakdown.get("breakout") else "ブレイク加点なし"
+        row["technical_lower_shadow_group"] = "下ヒゲ陽線あり" if _breakdown_has(row, "candle", "下ヒゲ陽線") else "下ヒゲ陽線なし"
+        intraday = row.get("intraday_entry_json") if isinstance(row.get("intraday_entry_json"), dict) else {}
+        row["technical_vwap_group"] = "VWAPあり" if intraday.get("vwap_ok") else "VWAPなし"
+        prepared.append(row)
+
+    st.markdown("**テクニカル採点別 成績**")
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("プリセット別勝率")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "technical_preset_group", "プリセット", shares)), width="stretch", hide_index=True)
+        st.caption("スコア帯別勝率")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "technical_score_bucket", "スコア帯", shares)), width="stretch", hide_index=True)
+        st.caption("25日線上/下")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "technical_25ma_group", "25日線", shares)), width="stretch", hide_index=True)
+    with cols[1]:
+        st.caption("テクニカル判定別")
+        st.dataframe(_safe_dataframe(_replay_group_performance_table(prepared, "technical_judgement_group", "判定", shares)), width="stretch", hide_index=True)
+        st.caption("条件別: VWAP / 出来高 / ブレイク / 下ヒゲ")
+        condition_rows = []
+        for key, label in [
+            ("technical_vwap_group", "VWAP"),
+            ("technical_volume_group", "出来高"),
+            ("technical_breakout_group", "ブレイク"),
+            ("technical_lower_shadow_group", "下ヒゲ"),
+        ]:
+            table = _replay_group_performance_table(prepared, key, label, shares)
+            if not table.empty:
+                condition_rows.extend(table.to_dict("records"))
+        st.dataframe(_safe_dataframe(pd.DataFrame(condition_rows)), width="stretch", hide_index=True)
 
 
 def _render_replay_fetch_summary(meta: Dict[str, Any]) -> None:
@@ -3851,6 +4000,158 @@ def _render_historical_scan_ab_comparison(comparison: Dict[str, Any]) -> None:
         st.info("簡易判定: 純損益は同水準です。勝率、損益比、最大損失で比較してください。")
 
 
+def _render_technical_config_controls(prefix: str, default_enabled: bool = True) -> Dict[str, Any]:
+    preset_options = get_technical_preset_options()
+    preset_keys = list(preset_options.keys())
+    preset_labels = [preset_options[key] for key in preset_keys]
+    with st.expander("テクニカル指標設定", expanded=False):
+        top_cols = st.columns(4)
+        use_technical_score = top_cols[0].toggle(
+            "テクニカル採点を使う",
+            value=default_enabled,
+            key=f"{prefix}_use_technical_score",
+            help="ONの場合、過去の各判定時点で見えていた日足だけを使って採点します。",
+        )
+        preset_label = top_cols[1].selectbox(
+            "使用プリセット",
+            preset_labels,
+            index=0,
+            key=f"{prefix}_technical_preset_label",
+        )
+        selected_preset = preset_keys[preset_labels.index(preset_label)]
+        technical_min_score = int(
+            top_cols[2].number_input(
+                "最小テクニカルスコア",
+                min_value=0,
+                max_value=60,
+                value=36,
+                step=1,
+                key=f"{prefix}_technical_min_score",
+            )
+        )
+        technical_show_breakdown = top_cols[3].toggle(
+            "score_breakdown表示",
+            value=True,
+            key=f"{prefix}_technical_show_breakdown",
+        )
+
+        preset_config = get_technical_config_for_preset(selected_preset)
+        key_prefix = f"{prefix}_{selected_preset}"
+        st.caption("プリセットを土台に、下の指標グループON/OFFで検証条件を調整できます。")
+        cols = st.columns(3)
+        technical_config = {
+            "preset_name": selected_preset,
+            "use_trend": cols[0].checkbox("トレンドを使う", value=bool(preset_config.get("use_trend", True)), key=f"{key_prefix}_tech_use_trend"),
+            "use_entry_position": cols[0].checkbox("エントリー位置を使う", value=bool(preset_config.get("use_entry_position", True)), key=f"{key_prefix}_tech_use_entry_position"),
+            "use_volume": cols[0].checkbox("出来高を使う", value=bool(preset_config.get("use_volume", True)), key=f"{key_prefix}_tech_use_volume"),
+            "use_candle": cols[1].checkbox("ローソク足を使う", value=bool(preset_config.get("use_candle", True)), key=f"{key_prefix}_tech_use_candle"),
+            "use_breakout": cols[1].checkbox("節目・ブレイクを使う", value=bool(preset_config.get("use_breakout", True)), key=f"{key_prefix}_tech_use_breakout"),
+            "use_momentum": cols[1].checkbox("RSI/MACDを使う", value=bool(preset_config.get("use_momentum", True)), key=f"{key_prefix}_tech_use_momentum"),
+            "use_risk_reward": cols[2].checkbox("損切り・リスクリワードを使う", value=bool(preset_config.get("use_risk_reward", True)), key=f"{key_prefix}_tech_use_risk_reward"),
+            "use_penalty": cols[2].checkbox("減点条件を使う", value=bool(preset_config.get("use_penalty", True)), key=f"{key_prefix}_tech_use_penalty"),
+            "use_hard_filter": cols[2].checkbox("強制見送り条件を使う", value=bool(preset_config.get("use_hard_filter", True)), key=f"{key_prefix}_tech_use_hard_filter"),
+        }
+        if use_technical_score:
+            st.info("この採点は過去リプレイ内だけで使います。OpenAI API、Discord通知、実売買には接続しません。")
+        else:
+            st.caption("OFFの場合、従来どおりマルチ時間足/リスク条件だけで検証します。")
+    return {
+        "use_technical_score": bool(use_technical_score),
+        "technical_preset": selected_preset,
+        "technical_min_score": int(technical_min_score),
+        "technical_show_breakdown": bool(technical_show_breakdown),
+        "technical_config": technical_config,
+    }
+
+
+def _render_candidate_generation_controls(prefix: str) -> Dict[str, Any]:
+    mode_label_to_value = {
+        "既存ロジック": CANDIDATE_MODE_EXISTING,
+        "テクニカルのみ": CANDIDATE_MODE_TECHNICAL_ONLY,
+        "既存ロジック＋テクニカル": CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+    }
+    cols = st.columns([1.5, 1, 1.3])
+    selected_label = cols[0].selectbox(
+        "候補発生モード",
+        list(mode_label_to_value.keys()),
+        index=0,
+        key=f"{prefix}_candidate_generation_mode_label",
+    )
+    show_stage_counts = cols[1].toggle(
+        "段階別通過件数を表示",
+        value=True,
+        key=f"{prefix}_show_stage_counts",
+    )
+    cols[2].caption("0件時は原因候補を自動表示します。")
+    mode = mode_label_to_value[selected_label]
+    if mode == CANDIDATE_MODE_TECHNICAL_ONLY:
+        st.info(
+            "テクニカルのみモードでは、既存の最小スコア、対象、5分足エントリー、"
+            "マルチ時間足、日足上位N、使用条件、リスク条件は候補発生に使いません。"
+            "その時点までに見えているOHLCVだけでテクニカル採点し、最小テクニカルスコア以上なら仮想買い候補にします。"
+        )
+    elif mode == CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL:
+        st.caption("既存ロジックを通過した候補に、テクニカル採点の最小点・強制見送り条件を追加で掛けます。")
+    else:
+        st.caption("従来どおり、既存の5分足/マルチ時間足/リスク条件を中心に候補を出します。")
+    return {
+        "candidate_generation_mode": mode,
+        "candidate_generation_mode_label": selected_label,
+        "show_stage_counts": bool(show_stage_counts),
+    }
+
+
+def _candidate_mode_label(value: Any) -> str:
+    return CANDIDATE_MODE_LABELS.get(str(value or ""), str(value or "-"))
+
+
+def _render_replay_stage_counts(summary: Dict[str, Any]) -> None:
+    stage_counts = summary.get("stage_counts", {})
+    if not isinstance(stage_counts, dict) or not stage_counts:
+        return
+    show_stage_counts = bool(summary.get("show_stage_counts", True))
+    zero_reasons = summary.get("zero_trade_reasons", [])
+    st.markdown("**候補発生の段階別通過件数**")
+    cols = st.columns(5)
+    cols[0].metric("候補発生モード", _candidate_mode_label(summary.get("candidate_generation_mode")))
+    cols[1].metric("スキャン総回数", stage_counts.get("scan_total_count", 0))
+    cols[2].metric("対象銘柄数", stage_counts.get("target_symbols_count", 0))
+    cols[3].metric("最終仮想買い", stage_counts.get("final_virtual_buy_count", 0))
+    cols[4].metric("最大件数で除外", stage_counts.get("max_trades_excluded_count", 0))
+    if zero_reasons and int(stage_counts.get("final_virtual_buy_count", 0) or 0) <= 0:
+        st.warning(" / ".join(str(item) for item in zero_reasons))
+    if not show_stage_counts:
+        return
+    rows = [
+        ("既存ロジック判定回数", "existing_logic_checked_count"),
+        ("既存ロジック通過", "existing_logic_pass_count"),
+        ("既存ロジック除外", "existing_logic_reject_count"),
+        ("テクニカル判定回数", "technical_score_checked_count"),
+        ("テクニカル通過", "technical_score_pass_count"),
+        ("テクニカル除外", "technical_score_reject_count"),
+        ("強制見送り除外", "hard_filter_reject_count"),
+        ("テクニカル採点実行回数", "technical_score_attempt_count"),
+        ("テクニカル採点成功回数", "technical_score_success_count"),
+        ("最小テクニカルスコア通過", "technical_min_score_pass_count"),
+        ("強制見送りで除外", "technical_hard_filter_excluded_count"),
+        ("confidence不足で除外", "technical_confidence_excluded_count"),
+        ("既存の最小スコア通過", "existing_min_score_pass_count"),
+        ("対象フィルター通過", "target_filter_pass_count"),
+        ("5分足エントリー通過", "intraday_entry_pass_count"),
+        ("使用条件通過", "use_conditions_pass_count"),
+        ("リスク条件通過", "risk_filter_pass_count"),
+    ]
+    table = pd.DataFrame(
+        [{"段階": label, "件数": stage_counts.get(key, 0)} for label, key in rows]
+    )
+    st.dataframe(_safe_dataframe(table), width="stretch", hide_index=True)
+    skip_reasons = stage_counts.get("skip_reasons", {})
+    if isinstance(skip_reasons, dict) and skip_reasons:
+        with st.expander("除外理由の内訳", expanded=False):
+            reason_rows = [{"理由": key, "件数": value} for key, value in skip_reasons.items()]
+            st.dataframe(_safe_dataframe(pd.DataFrame(reason_rows)), width="stretch", hide_index=True)
+
+
 def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     st.markdown("**watchlist過去スキャン再現**")
     st.caption("market_runner.pyの過去版です。watchlist全体を過去の各時刻でスキャンし、当時の買い候補を仮想買いとして検証します。")
@@ -3876,6 +4177,9 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     start_time = date_cols[1].time_input("開始時刻", value=dt_time(9, 0), key="historical_scan_start_time")
     end_date = date_cols[2].date_input("終了日", value=today, key="historical_scan_end_date")
     end_time = date_cols[3].time_input("終了時刻", value=dt_time(15, 30), key="historical_scan_end_time")
+
+    candidate_settings = _render_candidate_generation_controls("historical_scan")
+    candidate_mode = candidate_settings["candidate_generation_mode"]
 
     rule_cols = st.columns(5)
     min_score = int(rule_cols[0].selectbox("最小スコア", [60, 70, 75, 80], index=1, key="historical_scan_min_score"))
@@ -3903,7 +4207,10 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     daily_top_n = int(topn_cols[1].selectbox("日足スコア上位N", DAILY_TOP_N_OPTIONS, index=1, key="historical_scan_daily_top_n"))
     min_daily_score = int(topn_cols[2].number_input("日足スコアの最低点", min_value=0, max_value=100, value=70, step=1, key="historical_scan_min_daily_score"))
     topn_cols[3].metric("上位抽出後の銘柄数", f"最大{daily_top_n}銘柄/回" if use_daily_top_n else "制限なし")
-    st.caption("処理順: watchlist読み込み → 対象/除外フィルター → watchlist上限 → 各時刻の日足スコア上位N → 5分足エントリー → リスク条件 → 最大仮想買い件数")
+    if candidate_mode == CANDIDATE_MODE_TECHNICAL_ONLY:
+        st.caption("処理順: watchlist読み込み → 対象/除外フィルター → watchlist上限 → 各時刻のテクニカル採点 → 最小テクニカルスコア → 最大仮想買い件数")
+    else:
+        st.caption("処理順: watchlist読み込み → 対象/除外フィルター → watchlist上限 → 各時刻の日足スコア上位N → 5分足エントリー → リスク条件 → 最大仮想買い件数")
 
     risk_cols = st.columns(4)
     use_risk_filter = risk_cols[0].toggle("リスク条件を使う", value=True, key="historical_scan_use_risk_filter")
@@ -3916,6 +4223,27 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     min_risk_reward = float(
         risk_cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="historical_scan_min_risk_reward")
     )
+    technical_settings = _render_technical_config_controls("historical_scan", default_enabled=True)
+
+    cache_now = replay_cache_stats()
+    cache_cols = st.columns(5)
+    use_cache = cache_cols[0].toggle("キャッシュを使う", value=True, key="historical_scan_use_cache")
+    parallel = cache_cols[1].toggle("並列処理", value=True, key="historical_scan_parallel")
+    workers = int(cache_cols[2].selectbox("workers数", [1, 2, 3, 4], index=1, key="historical_scan_workers"))
+    cache_cols[3].metric("採点cache", cache_now.get("technical_score_cache_count", 0))
+    if cache_cols[4].button("キャッシュ削除", key="historical_scan_clear_cache"):
+        cleared_score = clear_replay_cache()
+        cleared_data = clear_historical_cache()
+        st.session_state["historical_scan_cache_clear_result"] = {
+            "technical": cleared_score,
+            "historical": cleared_data,
+        }
+    clear_result = st.session_state.get("historical_scan_cache_clear_result")
+    if clear_result:
+        st.caption(
+            f"キャッシュ削除: 採点 {clear_result.get('technical', {}).get('deleted_technical_score_rows', 0)}件 / "
+            f"過去データCSV {clear_result.get('historical', {}).get('deleted_files', 0)}件"
+        )
 
     filter_cols = st.columns(2)
     include_symbols_text = filter_cols[0].text_area(
@@ -3974,7 +4302,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         progress_bar = st.progress(0)
         status_box = st.empty()
 
-        progress_state = {"last_update": 0.0, "stage": ""}
+        progress_state = {"last_update": 0.0, "stage": "", "started": time.perf_counter()}
 
         def _progress(stage: str, current: int, total: int, label: str) -> None:
             now_perf = time.perf_counter()
@@ -3988,11 +4316,21 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
             progress_state["stage"] = stage
             progress_state["last_update"] = now_perf
             pct = int(min(100, max(0, current / max(1, total) * 100)))
+            elapsed = max(0.0, now_perf - float(progress_state["started"]))
+            eta = "-"
+            if current > 0 and total > current:
+                eta_seconds = elapsed / current * (total - current)
+                eta = f"{eta_seconds:.0f}秒"
             progress_bar.progress(pct)
-            status_box.info(f"{stage} {current}/{total} {label}")
+            status_box.info(f"{stage} {current}/{total} {label} / 経過 {elapsed:.1f}秒 / ETA {eta}")
 
         with st.spinner("watchlist過去スキャン再現を実行しています..."):
+            effective_use_technical_score = candidate_mode in {
+                CANDIDATE_MODE_TECHNICAL_ONLY,
+                CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+            }
             config = HistoricalScanReplayConfig(
+                candidate_generation_mode=candidate_mode,
                 period=REPLAY_PERIOD_OPTIONS[period_label],
                 interval=REPLAY_INTERVAL_OPTIONS[interval_label],
                 start_at=start_at,
@@ -4018,6 +4356,14 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 use_daily_top_n=bool(use_daily_top_n),
                 daily_top_n=int(daily_top_n),
                 min_daily_score=int(min_daily_score),
+                use_technical_score=effective_use_technical_score,
+                technical_preset=technical_settings["technical_preset"],
+                technical_min_score=technical_settings["technical_min_score"],
+                technical_show_breakdown=technical_settings["technical_show_breakdown"],
+                technical_config=technical_settings["technical_config"],
+                use_replay_cache=bool(use_cache),
+                parallel=bool(parallel),
+                max_workers=int(workers),
             )
             ab_comparison = {}
             if compare_exclude_mode and baseline_target_records:
@@ -4049,9 +4395,15 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
             result["summary"]["watchlist_filter"] = watchlist_filter_summary
             result["summary"]["include_symbols_text"] = include_symbols_text
             result["summary"]["exclude_symbols_text"] = exclude_symbols_text
+            result["summary"]["target_symbols"] = ",".join(
+                str(record.get("normalized_symbol") or normalize_jp_symbol(record.get("code")) or "")
+                for record in target_records
+            )
+            result["summary"]["excluded_symbols"] = ",".join(filter_result.get("excluded_symbols", []))
             result["summary"]["final_symbols_count"] = filter_result.get("final_count", 0)
             result["summary"]["target_records_count"] = len(target_records)
             result["summary"]["missing_symbols"] = filter_result.get("missing_symbols", [])
+            result["summary"]["show_stage_counts"] = candidate_settings["show_stage_counts"]
             db_save_started = time.perf_counter()
             store_result = insert_replay_trades(
                 result["trades"],
@@ -4063,6 +4415,8 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
                 + float(result["summary"].get("db_save_seconds", 0) or 0),
                 3,
             )
+            result["summary"]["db_saved_count"] = int(store_result.get("saved_count", 0) or 0)
+            result = attach_watchlist_replay_exports(result)
             run_record = {
                 **result["summary"],
                 "created_at_jst": now_jst_iso(),
@@ -4082,10 +4436,31 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         return
 
     _render_historical_scan_overall_summary(result)
+    _render_batch_condition_summary(result)
+    _render_batch_count_summary(result.get("summary", {}))
+    _render_replay_stage_counts(result.get("summary", {}))
     _render_historical_scan_ab_comparison(result.get("ab_comparison", {}))
     st.caption(f"DB保存: {store.get('saved_count', 0)}件 / {result.get('lookahead_note', '')}")
 
     trades = result.get("trades", [])
+    detail_export_df = result.get("trade_detail_df", pd.DataFrame())
+    summary_export_df = result.get("run_summary_df", pd.DataFrame())
+    if isinstance(summary_export_df, pd.DataFrame) and not summary_export_df.empty:
+        st.download_button(
+            "watchlist検証条件サマリーCSVをダウンロード",
+            data=summary_export_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="watchlist_replay_run_summary.csv",
+            mime="text/csv",
+            key="watchlist_replay_download_run_summary",
+        )
+    if isinstance(detail_export_df, pd.DataFrame) and not detail_export_df.empty:
+        st.download_button(
+            "watchlistトレード明細CSVをダウンロード",
+            data=detail_export_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="watchlist_replay_trades.csv",
+            mime="text/csv",
+            key="watchlist_replay_download_trades",
+        )
     symbol_summary = result.get("symbol_summary", pd.DataFrame())
     st.markdown("**グラフ**")
     _render_replay_profit_curve(trades, int(result["summary"].get("shares", shares)))
@@ -4104,6 +4479,7 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
     _render_multi_timeframe_performance(trades, int(result["summary"].get("shares", shares)))
     _render_daily_top_n_performance(trades, int(result["summary"].get("shares", shares)))
     _render_risk_performance(trades, int(result["summary"].get("shares", shares)))
+    _render_technical_performance(trades, int(result["summary"].get("shares", shares)))
 
     _render_historical_scan_rankings(symbol_summary)
 
@@ -4119,17 +4495,318 @@ def _render_watchlist_historical_scan_tab(watchlist: pd.DataFrame) -> None:
         st.caption(result.get("lookahead_note", ""))
 
 
+def _batch_context_value(context: Dict[str, Any], key: str, default: str = "-") -> str:
+    value = context.get(key, default)
+    if value in (None, ""):
+        return default
+    return str(value)
+
+
+def _render_batch_condition_summary(result: Dict[str, Any]) -> None:
+    context = result.get("run_context", {}) or {}
+    condition_rows = result.get("condition_rows", pd.DataFrame())
+    if (not isinstance(condition_rows, pd.DataFrame) or condition_rows.empty) and isinstance(result.get("run_summary_df"), pd.DataFrame):
+        condition_rows = result.get("run_summary_df", pd.DataFrame())
+    presets = "-"
+    min_scores = "-"
+    modes = "-"
+    config_hashes = "-"
+    if isinstance(condition_rows, pd.DataFrame) and not condition_rows.empty:
+        presets = ", ".join(sorted({str(value) for value in condition_rows.get("preset", []) if str(value)})) or "-"
+        min_scores = ", ".join(sorted({str(value) for value in condition_rows.get("min_technical_score", []) if str(value)})) or "-"
+        modes = ", ".join(sorted({str(value) for value in condition_rows.get("candidate_mode", []) if str(value)})) or "-"
+        config_hashes = ", ".join(sorted({str(value) for value in condition_rows.get("config_hash", []) if str(value)})) or "-"
+
+    st.markdown("**検証条件**")
+    cols = st.columns(4)
+    cols[0].metric("候補発生モード", modes)
+    cols[1].metric("プリセット", presets)
+    cols[2].metric("最小テクニカル", min_scores)
+    cols[3].metric("想定株数", f"{_batch_context_value(context, 'assumed_shares')}株")
+    cols = st.columns(4)
+    cols[0].metric("期間", _batch_context_value(context, "period"))
+    cols[1].metric("時間足", _batch_context_value(context, "interval"))
+    cols[2].metric("最大買い/銘柄", _batch_context_value(context, "max_trades_per_symbol"))
+    cols[3].metric("連続抑制", _batch_context_value(context, "cooldown_bars_or_minutes"))
+    with st.expander("検証条件の詳細", expanded=False):
+        rows = [
+            {"項目": "run_id", "値": _batch_context_value(context, "run_id")},
+            {"項目": "run_datetime", "値": _batch_context_value(context, "run_datetime")},
+            {"項目": "対象銘柄", "値": _batch_context_value(context, "target_symbols")},
+            {"項目": "除外銘柄", "値": _batch_context_value(context, "excluded_symbols")},
+            {"項目": "watchlist上限", "値": _batch_context_value(context, "watchlist_limit")},
+            {"項目": "同一銘柄1ポジション", "値": "ON" if context.get("one_position_per_symbol") else "OFF"},
+            {"項目": "キャッシュ", "値": "ON" if context.get("cache_enabled") else "OFF"},
+            {"項目": "並列処理", "値": "ON" if context.get("parallel_enabled") else "OFF"},
+            {"項目": "workers", "値": _batch_context_value(context, "workers")},
+            {"項目": "config_hash", "値": config_hashes},
+        ]
+        st.dataframe(_safe_dataframe(pd.DataFrame(rows)), width="stretch", hide_index=True)
+
+
+def _render_batch_count_summary(summary: Dict[str, Any]) -> None:
+    st.markdown("**件数サマリー**")
+    cols = st.columns(4)
+    cols[0].metric("候補シグナル数", summary.get("raw_signal_count", 0))
+    cols[1].metric("最終採用トレード数", summary.get("final_trade_count", summary.get("total_trades", 0)))
+    cols[2].metric("確定損益対象", summary.get("settled_trade_count", 0))
+    cols[3].metric("CSV出力件数", summary.get("csv_export_count", 0))
+    cols = st.columns(4)
+    cols[0].metric("連続抑制で除外", summary.get("cooldown_filtered_count", 0))
+    cols[1].metric("1ポジ制限で除外", summary.get("position_filtered_count", 0))
+    cols[2].metric("最大件数で除外", summary.get("max_trade_filtered_count", 0))
+    cols[3].metric("DB保存件数", summary.get("db_saved_count", 0))
+    cols = st.columns(4)
+    cols[0].metric("既存ロジック通過", summary.get("existing_logic_pass_count", 0))
+    cols[1].metric("既存ロジック除外", summary.get("existing_logic_reject_count", 0))
+    cols[2].metric("テクニカル通過", summary.get("technical_score_pass_count", 0))
+    cols[3].metric("強制見送り除外", summary.get("hard_filter_reject_count", 0))
+    raw_count = int(summary.get("raw_signal_count", 0) or 0)
+    csv_count = int(summary.get("csv_export_count", 0) or 0)
+    if raw_count != csv_count:
+        st.info(
+            "候補シグナル数とCSV明細件数は異なる場合があります。CSVには、連続シグナル抑制、"
+            "同一銘柄1ポジション制限、銘柄ごとの最大件数制限などを適用した後の最終採用トレードのみ出力しています。"
+        )
+
+
+def _render_multi_symbol_replay_comparison_tab(watchlist: pd.DataFrame) -> None:
+    st.markdown("**複数銘柄比較**")
+    st.caption("複数銘柄を同じOHLCVデータでまとめて検証します。OpenAI API、Discord通知、実売買・発注は行いません。")
+    if watchlist.empty:
+        st.warning("watchlist.csvに有効な銘柄がありません。")
+        return
+
+    cache_now = replay_cache_stats()
+    cache_cols = st.columns(5)
+    use_cache = cache_cols[0].toggle("キャッシュ使用", value=True, key="batch_replay_use_cache")
+    if cache_cols[1].button("キャッシュクリア", key="batch_replay_clear_cache"):
+        cleared = clear_replay_cache()
+        st.session_state["batch_replay_cache_clear_result"] = cleared
+    cache_cols[2].metric("採点キャッシュ", cache_now.get("technical_score_cache_count", 0))
+    cache_cols[3].metric("hit", cache_now.get("technical_hits", 0))
+    cache_cols[4].metric("miss", cache_now.get("technical_misses", 0))
+    if st.session_state.get("batch_replay_cache_clear_result"):
+        st.caption(f"削除: {st.session_state['batch_replay_cache_clear_result'].get('deleted_technical_score_rows', 0)}件")
+
+    option_cols = st.columns(5)
+    max_symbols_label = option_cols[0].selectbox(
+        "watchlistから使う最大銘柄数",
+        list(HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS.keys()),
+        index=1,
+        key="batch_replay_max_symbols",
+    )
+    period_label = option_cols[1].selectbox("期間", list(REPLAY_PERIOD_OPTIONS.keys()), index=0, key="batch_replay_period")
+    interval_label = option_cols[2].selectbox("時間足", list(REPLAY_INTERVAL_OPTIONS.keys()), index=0, key="batch_replay_interval")
+    shares = int(option_cols[3].selectbox("想定株数", [100, 200, 300, 500, 1000], index=0, key="batch_replay_shares"))
+    max_trades = int(option_cols[4].selectbox("銘柄ごとの最大仮想買い", [10, 20, 50, 100], index=2, key="batch_replay_max_trades"))
+
+    filter_cols = st.columns(2)
+    include_symbols_text = filter_cols[0].text_area(
+        "対象銘柄のみ",
+        value="",
+        placeholder="例: 8035.T,5803.T,6501.T",
+        height=84,
+        key="batch_replay_include_symbols_text",
+    )
+    exclude_symbols_text = filter_cols[1].text_area(
+        "除外銘柄",
+        value="",
+        placeholder="例: 9999.T",
+        height=84,
+        key="batch_replay_exclude_symbols_text",
+    )
+    filter_result = filter_watchlist_symbols(
+        watchlist,
+        include_symbols=parse_symbol_input(include_symbols_text),
+        exclude_symbols=parse_symbol_input(exclude_symbols_text),
+    )
+    filtered_watchlist = filter_result.get("filtered_watchlist", pd.DataFrame())
+    max_symbols = HISTORICAL_SCAN_MAX_SYMBOL_OPTIONS[max_symbols_label]
+    target_watchlist = filtered_watchlist if max_symbols is None else filtered_watchlist.head(int(max_symbols))
+    target_records = target_watchlist.to_dict("records")
+    _render_watchlist_filter_status(filter_result, len(target_records))
+
+    preset_options = get_technical_preset_options()
+    preset_label_to_key = {label: key for key, label in preset_options.items()}
+    condition_cols = st.columns(4)
+    mode_labels = condition_cols[0].multiselect(
+        "候補発生モード",
+        ["テクニカルのみ", "既存ロジック", "既存ロジック＋テクニカル"],
+        default=["テクニカルのみ"],
+        key="batch_replay_candidate_modes",
+    )
+    preset_labels = condition_cols[1].multiselect(
+        "プリセット",
+        list(preset_label_to_key.keys()),
+        default=["標準スイング"],
+        key="batch_replay_presets",
+    )
+    min_scores = condition_cols[2].multiselect(
+        "最小テクニカルスコア",
+        [20, 25, 30, 32, 36, 42],
+        default=[32],
+        key="batch_replay_min_scores",
+    )
+    hard_filter_labels = condition_cols[3].multiselect(
+        "強制見送り",
+        ["ON", "OFF"],
+        default=["ON"],
+        key="batch_replay_hard_filter_options",
+    )
+    use_penalty = st.toggle("減点条件を使う", value=True, key="batch_replay_use_penalty")
+    with st.expander("候補発生モードの違い", expanded=False):
+        st.markdown(
+            "- **テクニカルのみ**：既存ロジックを使わず、テクニカル採点だけで候補化します。\n"
+            "- **既存ロジック**：従来の5分足/マルチ時間足/リスク条件だけで候補化し、テクニカル採点は必須にしません。\n"
+            "- **既存ロジック＋テクニカル**：既存ロジックを通過した候補だけに、テクニカル採点の最小点と強制見送り条件を追加で掛けます。"
+        )
+
+    run_cols = st.columns(5)
+    one_position = run_cols[0].toggle("同一銘柄1ポジション制限", value=True, key="batch_replay_one_position")
+    parallel = run_cols[1].toggle("並列処理", value=False, key="batch_replay_parallel")
+    workers = int(run_cols[2].selectbox("workers数", [1, 2, 3, 4], index=1, key="batch_replay_workers"))
+    cooldown_bars = int(run_cols[3].selectbox("連続シグナル抑制", [3, 6, 12, 24], index=2, key="batch_replay_cooldown_bars"))
+    save_to_db = run_cols[4].toggle("DB保存", value=False, key="batch_replay_save_to_db")
+
+    mode_map = {
+        "テクニカルのみ": CANDIDATE_MODE_TECHNICAL_ONLY,
+        "既存ロジック": CANDIDATE_MODE_EXISTING,
+        "既存ロジック＋テクニカル": CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+    }
+    variants = build_condition_variants(
+        modes=[mode_map[label] for label in mode_labels],
+        presets=[preset_label_to_key[label] for label in preset_labels],
+        min_scores=[int(score) for score in min_scores],
+        hard_filter_options=[label == "ON" for label in hard_filter_labels],
+        use_penalty=use_penalty,
+    )
+    st.caption(f"検証条件数: {len(variants)} / 対象銘柄数: {len(target_records)}")
+    run_disabled = not target_records or not variants
+    if run_disabled:
+        st.warning("対象銘柄または検証条件が0件です。")
+
+    if st.button("複数銘柄比較を実行", key="run_batch_replay_button", type="primary", disabled=run_disabled):
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+
+        def _progress(stage: str, current: int, total: int, label: str) -> None:
+            pct = int(min(100, max(0, current / max(1, total) * 100)))
+            progress_bar.progress(pct)
+            status_box.info(f"{stage} {current}/{total} {label}")
+
+        with st.spinner("複数銘柄比較を実行しています..."):
+            result = run_multi_symbol_replay_comparison(
+                target_records,
+                BatchReplayConfig(
+                    period=REPLAY_PERIOD_OPTIONS[period_label],
+                    interval=REPLAY_INTERVAL_OPTIONS[interval_label],
+                    max_trades=max_trades,
+                    cooldown_bars=cooldown_bars,
+                    shares=shares,
+                    use_replay_cache=use_cache,
+                    parallel=parallel,
+                    max_workers=workers,
+                    one_position_per_symbol=one_position,
+                    variants=variants,
+                    target_symbols=",".join(
+                        str(record.get("normalized_symbol") or normalize_jp_symbol(record.get("code")) or "")
+                        for record in target_records
+                    ),
+                    excluded_symbols=",".join(parse_symbol_input(exclude_symbols_text)),
+                    watchlist_limit=max_symbols_label,
+                ),
+                progress_callback=_progress,
+            )
+            store_result = {}
+            if save_to_db and result.get("trades"):
+                store_result = insert_replay_trades(result["trades"])
+            result["store_result"] = store_result
+            result.setdefault("summary", {})["db_saved_count"] = int(store_result.get("saved_count", 0) or 0)
+            if isinstance(result.get("run_summary_df"), pd.DataFrame) and not result["run_summary_df"].empty:
+                saved_count = int(store_result.get("saved_count", 0) or 0)
+                result["run_summary_df"]["db_saved_count"] = (
+                    result["run_summary_df"]["final_trade_count"] if saved_count else 0
+                )
+        st.session_state["batch_replay_result"] = result
+        status_box.success(f"完了: 仮想買い {len(result.get('trades', []))}件")
+
+    result = st.session_state.get("batch_replay_result")
+    if not result:
+        st.info("まだ複数銘柄比較の結果はありません。条件を設定して実行してください。")
+        return
+
+    summary = result.get("summary", {})
+    _render_batch_condition_summary(result)
+    st.markdown("**比較サマリー**")
+    cols = st.columns(6)
+    cols[0].metric("対象銘柄", summary.get("symbols_count", 0))
+    cols[1].metric("取得成功", summary.get("success_count", 0))
+    cols[2].metric("取得失敗", summary.get("error_count", 0))
+    cols[3].metric("処理秒", summary.get("elapsed_seconds", 0))
+    cache = summary.get("cache", {})
+    cols[4].metric("cache hit率", f"{cache.get('technical_hit_rate_pct', 0)}%")
+    cols[5].metric("短縮秒", cache.get("technical_saved_seconds", 0))
+    _render_batch_count_summary(summary)
+
+    symbol_rows = result.get("symbol_rows", pd.DataFrame())
+    condition_rows = result.get("condition_rows", pd.DataFrame())
+    sort_key = st.selectbox(
+        "銘柄別サマリーの並び替え",
+        ["純損益", "勝率", "仮想買い件数", "最大連敗", "平均損益", "処理秒数"],
+        index=0,
+        key="batch_replay_sort_key",
+    )
+    if isinstance(symbol_rows, pd.DataFrame) and not symbol_rows.empty:
+        ascending = sort_key in {"最大連敗", "処理秒数"}
+        st.markdown("**銘柄別サマリー**")
+        st.dataframe(_safe_dataframe(symbol_rows.sort_values(sort_key, ascending=ascending)), width="stretch", hide_index=True)
+    if isinstance(condition_rows, pd.DataFrame) and not condition_rows.empty:
+        st.markdown("**条件別サマリー**")
+        st.dataframe(_safe_dataframe(condition_rows.sort_values("純損益", ascending=False)), width="stretch", hide_index=True)
+
+    trades = result.get("trades", [])
+    detail_export_df = result.get("trade_detail_df", pd.DataFrame())
+    summary_export_df = result.get("run_summary_df", pd.DataFrame())
+    if isinstance(summary_export_df, pd.DataFrame) and not summary_export_df.empty:
+        st.download_button(
+            "検証条件サマリーCSVをダウンロード",
+            data=summary_export_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="batch_replay_run_summary.csv",
+            mime="text/csv",
+            key="batch_replay_download_run_summary",
+        )
+    if trades:
+        csv_df = detail_export_df if isinstance(detail_export_df, pd.DataFrame) and not detail_export_df.empty else _historical_scan_trade_table(trades, shares)
+        st.download_button(
+            "トレード明細CSVをダウンロード",
+            data=csv_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="batch_replay_trades.csv",
+            mime="text/csv",
+            key="batch_replay_download_trades",
+        )
+        with st.expander("詳細トレード一覧", expanded=False):
+            st.dataframe(_safe_dataframe(csv_df), width="stretch", hide_index=True)
+    errors = result.get("errors", [])
+    if errors:
+        with st.expander("途中エラー一覧", expanded=False):
+            st.dataframe(_safe_dataframe(pd.DataFrame(errors)), width="stretch", hide_index=True)
+
+
 def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     st.subheader("過去リプレイ検証")
     st.caption("過去データを1本ずつ進め、その時点までの情報だけでルール買いを検証します。実売買・発注・OpenAI API呼び出しは行いません。")
     replay_mode = st.radio(
         "モード",
-        ["単一銘柄リプレイ", "watchlist過去スキャン再現"],
+        ["単一銘柄リプレイ", "watchlist過去スキャン再現", "複数銘柄比較"],
         horizontal=True,
         key="historical_replay_mode",
     )
     if replay_mode == "watchlist過去スキャン再現":
         _render_watchlist_historical_scan_tab(watchlist)
+        return
+    if replay_mode == "複数銘柄比較":
+        _render_multi_symbol_replay_comparison_tab(watchlist)
         return
 
     input_cols = st.columns([1.1, 1.1, 1, 1])
@@ -4182,6 +4859,9 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     end_date = range_cols[2].date_input("終了日", value=last_dt.date(), key="replay_end_date")
     end_time = range_cols[3].time_input("終了時刻", value=last_dt.time().replace(second=0, microsecond=0), key="replay_end_time")
 
+    candidate_settings = _render_candidate_generation_controls("single_replay")
+    candidate_mode = candidate_settings["candidate_generation_mode"]
+
     rule_cols = st.columns(5)
     min_score = rule_cols[0].selectbox("最小スコア", [60, 70, 75, 80], index=1, key="replay_min_score")
     target_rule_label = rule_cols[1].selectbox("対象ルール", REPLAY_RULE_OPTIONS, index=0, key="replay_target_rule")
@@ -4214,6 +4894,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
     replay_min_risk_reward = float(
         risk_cols[3].number_input("最低損益比", min_value=0.1, max_value=10.0, value=1.2, step=0.1, key="replay_min_risk_reward")
     )
+    technical_settings = _render_technical_config_controls("single_replay", default_enabled=True)
 
     start_at = _combine_date_time(start_date, start_time)
     end_at = _combine_date_time(end_date, end_time)
@@ -4223,6 +4904,10 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
 
     if st.button("リプレイ検証を実行", key="run_historical_replay_button", type="primary", disabled=run_disabled):
         with st.spinner("過去リプレイ検証を実行しています..."):
+            effective_use_technical_score = candidate_mode in {
+                CANDIDATE_MODE_TECHNICAL_ONLY,
+                CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+            }
             result = run_replay(
                 symbol=normalize_jp_symbol(symbol),
                 name=name,
@@ -4231,6 +4916,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
                 start_at=start_at,
                 end_at=end_at,
                 rule_config={
+                    "candidate_generation_mode": candidate_mode,
                     "min_score": int(min_score),
                     "target_rule": REPLAY_RULE_LABEL_TO_SIGNAL.get(target_rule_label, "すべて"),
                     "max_trades": int(max_trades),
@@ -4247,8 +4933,14 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
                     "max_stop_loss_pct": replay_max_stop_loss_pct,
                     "max_loss_yen_limit": replay_max_loss_yen_limit,
                     "min_risk_reward": replay_min_risk_reward,
+                    "use_technical_score": effective_use_technical_score,
+                    "technical_preset": technical_settings["technical_preset"],
+                    "technical_min_score": technical_settings["technical_min_score"],
+                    "technical_show_breakdown": technical_settings["technical_show_breakdown"],
+                    "technical_config": technical_settings["technical_config"],
                 },
             )
+            result["summary"]["show_stage_counts"] = candidate_settings["show_stage_counts"]
             result["trades"] = apply_replay_money_metrics(result["trades"], replay_shares)
             result["money_summary"] = summarize_replay_money(result["trades"], replay_shares)
             store_result = insert_replay_trades(result["trades"])
@@ -4265,6 +4957,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
         trades = apply_replay_money_metrics(last_result.get("trades", []), display_shares)
         money_summary = summarize_replay_money(trades, display_shares)
         _render_replay_summary(summary, int(last_store.get("saved_count", 0)))
+        _render_replay_stage_counts(summary)
         _render_replay_money_summary(money_summary)
         _replay_extreme_result_warnings(trades)
         _render_replay_profit_curve(trades, display_shares)
@@ -4274,6 +4967,7 @@ def _render_historical_replay_tab(watchlist: pd.DataFrame) -> None:
             st.dataframe(_safe_dataframe(_replay_result_table(trades, display_shares)), width="stretch", hide_index=True)
             _render_multi_timeframe_performance(trades, display_shares)
             _render_risk_performance(trades, display_shares)
+            _render_technical_performance(trades, display_shares)
         else:
             st.info("条件に一致する仮想買いポイントはありませんでした。")
 
@@ -4384,6 +5078,327 @@ def _render_stock_personality_tab() -> None:
             st.markdown(f"**苦手パターン**：{row.get('weak_patterns')}")
             st.markdown(f"**最適保有目安**：{row.get('best_hold_period')}")
             st.markdown(f"**注意点**：{row.get('caution')}")
+
+
+def _join_reason_text(values: Any) -> str:
+    if values in (None, ""):
+        return "-"
+    if isinstance(values, str):
+        return values or "-"
+    if isinstance(values, (list, tuple, set)):
+        return " / ".join(str(value) for value in values if str(value)) or "-"
+    return str(values)
+
+
+def _technical_breakdown_text(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "-"
+    parts = []
+    for section, reasons in value.items():
+        if not reasons:
+            continue
+        if isinstance(reasons, str):
+            reason_text = reasons
+        elif isinstance(reasons, (list, tuple, set)):
+            reason_text = "、".join(str(item) for item in reasons if str(item))
+        else:
+            reason_text = str(reasons)
+        if reason_text:
+            parts.append(f"{section}: {reason_text}")
+    return " / ".join(parts) if parts else "-"
+
+
+def _technical_score_display_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
+    columns = [
+        "順位",
+        "code",
+        "name",
+        "現在値",
+        "総合点",
+        "素点",
+        "減点",
+        "判定",
+        "確度",
+        "トレンド",
+        "位置",
+        "出来高",
+        "ローソク",
+        "ブレイク",
+        "RSI/MACD",
+        "R/R点",
+        "損切り候補",
+        "損切り幅",
+        "利確候補",
+        "R/R",
+        "保有目安",
+        "買いタイミング",
+        "減点理由",
+        "ハード除外",
+        "不足データ",
+        "更新時刻",
+    ]
+    rows = []
+    for rank, row in enumerate(results, start=1):
+        rows.append(
+            {
+                "順位": rank,
+                "code": row.get("code", ""),
+                "name": row.get("name", ""),
+                "現在値": format_yen(row.get("close")),
+                "総合点": f"{row.get('technical_score_final', 0)}/60",
+                "素点": row.get("technical_score_raw", 0),
+                "減点": row.get("penalty_score", 0),
+                "判定": row.get("technical_judgement", "-"),
+                "確度": f"{row.get('confidence', 0)}%",
+                "トレンド": f"{row.get('trend_score', 0)}/14",
+                "位置": f"{row.get('entry_position_score', 0)}/10",
+                "出来高": f"{row.get('volume_score', 0)}/10",
+                "ローソク": f"{row.get('candle_score', 0)}/8",
+                "ブレイク": f"{row.get('breakout_score', 0)}/8",
+                "RSI/MACD": f"{row.get('momentum_score', 0)}/6",
+                "R/R点": f"{row.get('risk_reward_score', 0)}/4",
+                "損切り候補": format_yen(row.get("stop_loss_candidate")),
+                "損切り幅": _format_plain_pct(row.get("stop_loss_distance_pct")),
+                "利確候補": format_yen(row.get("target_price_candidate")),
+                "R/R": _format_profit_loss_ratio(row.get("risk_reward")),
+                "保有目安": row.get("hold_days_hint", "-"),
+                "買いタイミング": row.get("buy_timing_hint", "-"),
+                "減点理由": _join_reason_text(row.get("penalty_reasons")),
+                "ハード除外": _join_reason_text(row.get("hard_filter_reason")),
+                "不足データ": _join_reason_text(row.get("missing_data")),
+                "更新時刻": row.get("last_updated_at", "-"),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _daily_fetch_error_table(errors: List[Dict[str, Any]]) -> pd.DataFrame:
+    columns = [
+        "code",
+        "name",
+        "normalized_symbol",
+        "fetch_target",
+        "error_type",
+        "error_message",
+        "last_attempt_at",
+    ]
+    rows = []
+    for error in errors:
+        rows.append(
+            {
+                "code": str(error.get("code", "") or "-"),
+                "name": str(error.get("name", "") or "-"),
+                "normalized_symbol": str(error.get("normalized_symbol", "") or "-"),
+                "fetch_target": str(error.get("fetch_target", "") or "daily_technical"),
+                "error_type": str(error.get("error_type", "") or "unknown_error"),
+                "error_message": str(error.get("error_message", "") or "エラー理由が空でした。"),
+                "last_attempt_at": str(error.get("last_attempt_at", "") or now_jst_display()),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _technical_score_breakdown_table(result: Dict[str, Any]) -> pd.DataFrame:
+    labels = {
+        "trend": "A トレンド",
+        "entry_position": "B エントリー位置",
+        "volume": "C 出来高",
+        "candle": "D ローソク足",
+        "breakout": "E ブレイク",
+        "momentum": "F RSI/MACD",
+        "risk_reward": "G リスク/リワード",
+        "penalty": "減点",
+    }
+    points = {
+        "trend": f"{result.get('trend_score', 0)}/14",
+        "entry_position": f"{result.get('entry_position_score', 0)}/10",
+        "volume": f"{result.get('volume_score', 0)}/10",
+        "candle": f"{result.get('candle_score', 0)}/8",
+        "breakout": f"{result.get('breakout_score', 0)}/8",
+        "momentum": f"{result.get('momentum_score', 0)}/6",
+        "risk_reward": f"{result.get('risk_reward_score', 0)}/4",
+        "penalty": result.get("penalty_score", 0),
+    }
+    breakdown = result.get("score_breakdown") or {}
+    return pd.DataFrame(
+        [
+            {
+                "項目": label,
+                "点数": points.get(key, "-"),
+                "理由": _join_reason_text(breakdown.get(key)),
+            }
+            for key, label in labels.items()
+        ]
+    )
+
+
+def _technical_latest_metrics_table(result: Dict[str, Any]) -> pd.DataFrame:
+    metrics = result.get("latest_metrics") or {}
+    rows = [
+        ("終値", format_yen(metrics.get("close"))),
+        ("前日比", _format_plain_pct(metrics.get("daily_change_pct"))),
+        ("ギャップ", _format_plain_pct(metrics.get("gap_pct"))),
+        ("5日線", format_yen(metrics.get("ma5"))),
+        ("25日線", format_yen(metrics.get("ma25"))),
+        ("75日線", format_yen(metrics.get("ma75"))),
+        ("25日線乖離", _format_plain_pct(metrics.get("distance_from_ma25_pct"))),
+        ("出来高20日比", _format_profit_loss_ratio(metrics.get("volume_ratio_20"))),
+        ("RSI14", _format_profit_loss_ratio(metrics.get("rsi14"))),
+        ("MACD", _format_profit_loss_ratio(metrics.get("macd"))),
+        ("MACD signal", _format_profit_loss_ratio(metrics.get("macd_signal"))),
+        ("ATR率", _format_plain_pct(metrics.get("atr_pct"))),
+        ("20日高値", format_yen(metrics.get("recent_high_20"))),
+        ("20日安値", format_yen(metrics.get("recent_low_20"))),
+        ("陽線", "OK" if metrics.get("is_bullish_candle") else "NG"),
+        ("下ヒゲ陽線", "OK" if metrics.get("is_lower_shadow_bullish") else "NG"),
+        ("長い上ヒゲ警戒", "警戒" if metrics.get("is_upper_shadow_warning") else "なし"),
+    ]
+    return pd.DataFrame(rows, columns=["指標", "値"])
+
+
+def _render_technical_score_detail(result: Dict[str, Any]) -> None:
+    cols = st.columns(4)
+    cols[0].metric("総合点", f"{result.get('technical_score_final', 0)}/60")
+    cols[1].metric("判定", result.get("technical_judgement", "-"))
+    cols[2].metric("確度", f"{result.get('confidence', 0)}%")
+    cols[3].metric("現在値", format_yen(result.get("close")))
+
+    cols = st.columns(4)
+    cols[0].metric("損切り候補", format_yen(result.get("stop_loss_candidate")))
+    cols[1].metric("損切り幅", _format_plain_pct(result.get("stop_loss_distance_pct")))
+    cols[2].metric("利確候補", format_yen(result.get("target_price_candidate")))
+    cols[3].metric("R/R", _format_profit_loss_ratio(result.get("risk_reward")))
+
+    st.markdown(f"**保有目安**：{result.get('hold_days_hint', '-')}")
+    st.markdown(f"**買いタイミング**：{result.get('buy_timing_hint', '-')}")
+    hard_filter_text = _join_reason_text(result.get("hard_filter_reason"))
+    penalty_text = _join_reason_text(result.get("penalty_reasons"))
+    missing_text = _join_reason_text(result.get("missing_data"))
+    if result.get("hard_filter_reason"):
+        st.warning(f"強制見送り理由：{hard_filter_text}")
+    else:
+        st.caption("強制見送り理由：なし")
+    st.caption(f"減点理由：{penalty_text if penalty_text != '-' else 'なし'}")
+    st.caption(f"不足データ：{missing_text if missing_text != '-' else 'なし'}")
+
+    st.markdown("**スコア内訳**")
+    st.dataframe(_safe_dataframe(_technical_score_breakdown_table(result)), width="stretch", hide_index=True)
+    with st.expander("日足指標詳細", expanded=False):
+        st.dataframe(_safe_dataframe(_technical_latest_metrics_table(result)), width="stretch", hide_index=True)
+
+
+def _render_daily_technical_tab(watchlist: pd.DataFrame) -> None:
+    st.subheader("日足データ取得・テクニカル採点")
+    st.caption("OpenAI APIは呼ばず、日足OHLCVからルールベースで採点します。実売買・自動売買ではありません。")
+
+    if "daily_data" not in st.session_state:
+        st.session_state["daily_data"] = {}
+    if "fetch_errors" not in st.session_state:
+        st.session_state["fetch_errors"] = []
+
+    records = watchlist.to_dict("records") if not watchlist.empty else []
+    limit_options = {
+        "10件": 10,
+        "30件": 30,
+        "50件": 50,
+        "全件": None,
+    }
+    setting_cols = st.columns([1, 3])
+    limit_label = setting_cols[0].selectbox(
+        "日足取得件数",
+        list(limit_options.keys()),
+        index=1,
+        key="daily_technical_fetch_limit_label",
+        help="まず10件、次に30件、必要なら50件/全件の順で段階的に取得できます。",
+    )
+    fetch_limit = limit_options[limit_label]
+    target_records = records if fetch_limit is None else records[:fetch_limit]
+    setting_cols[1].caption(
+        f"watchlist全体: {len(records)}銘柄 / 今回の取得対象: {len(target_records)}銘柄。"
+        "通信が重い場合は10件から確認してください。"
+    )
+
+    controls = st.columns([1, 1, 2])
+    fetch_clicked = controls[0].button("日足データ取得", key="fetch_daily_technical_data_button", type="primary")
+    score_clicked = controls[1].button(
+        "テクニカル採点",
+        key="score_daily_technical_data_button",
+        disabled=not bool(st.session_state.get("daily_data")),
+    )
+    controls[2].caption(
+        f"取得期間: {DEFAULT_DAILY_FETCH_PERIOD} / 必要本数: {MIN_DAILY_HISTORY_ROWS}本以上 / 段階取得: {limit_label}"
+    )
+
+    if fetch_clicked:
+        if not target_records:
+            st.error("watchlist.csvに銘柄がありません。日足データ取得を実行できません。")
+        else:
+            with st.spinner("watchlistの日足データを取得しています..."):
+                daily_data, fetch_errors = fetch_daily_technical_data(target_records)
+            st.session_state["daily_data"] = daily_data
+            st.session_state["fetch_errors"] = fetch_errors
+            st.session_state["technical_scores"] = []
+            st.session_state["daily_data_last_fetched_at"] = now_jst_display()
+            st.session_state["daily_data_fetch_limit_label"] = limit_label
+            st.success(f"日足データ取得完了: 成功 {len(daily_data)}件 / 失敗 {len(fetch_errors)}件")
+
+    if score_clicked:
+        daily_data = st.session_state.get("daily_data") or {}
+        if not daily_data:
+            st.warning("先に「日足データ取得」を実行してください。")
+        else:
+            with st.spinner("日足テクニカルを採点しています..."):
+                results = score_daily_technical_data(daily_data)
+            st.session_state["technical_scores"] = results
+            st.session_state["technical_scores_last_scored_at"] = now_jst_display()
+            st.success(f"テクニカル採点完了: {len(results)}件")
+
+    daily_data = st.session_state.get("daily_data") or {}
+    fetch_errors = st.session_state.get("fetch_errors") or []
+    results = st.session_state.get("technical_scores") or []
+
+    st.markdown("**取得・採点サマリー**")
+    cols = st.columns(7)
+    scored_count = len(results)
+    strong_count = sum(1 for row in results if row.get("technical_score_final", 0) >= 50)
+    buy_count = sum(1 for row in results if row.get("technical_score_final", 0) >= 42)
+    conditional_count = sum(1 for row in results if row.get("technical_score_final", 0) >= 36)
+    watch_count = sum(1 for row in results if row.get("technical_judgement") == "監視強化")
+    avoid_count = sum(1 for row in results if row.get("technical_judgement") in {"見送り", "触らない"})
+    cols[0].metric("採点対象", f"{scored_count}件")
+    cols[1].metric("50点以上", f"{strong_count}件")
+    cols[2].metric("42点以上", f"{buy_count}件")
+    cols[3].metric("36点以上", f"{conditional_count}件")
+    cols[4].metric("監視強化", f"{watch_count}件")
+    cols[5].metric("見送り", f"{avoid_count}件")
+    cols[6].metric("取得エラー", f"{len(fetch_errors)}件")
+    st.caption(
+        f"最終取得: {st.session_state.get('daily_data_last_fetched_at', '-')} / "
+        f"最終採点: {st.session_state.get('technical_scores_last_scored_at', '-')} / "
+        f"前回取得件数: {st.session_state.get('daily_data_fetch_limit_label', '-')}"
+    )
+
+    if not daily_data and not fetch_errors:
+        st.info("まだ日足データを取得していません。「日足データ取得」を押してください。")
+
+    if results:
+        st.markdown("**テクニカル採点結果（総合点順）**")
+        st.dataframe(_safe_dataframe(_technical_score_display_table(results)), width="stretch", hide_index=True)
+        st.markdown("**銘柄別詳細**")
+        for result in results:
+            title = (
+                f"{result.get('code')} {result.get('name')}｜"
+                f"{result.get('technical_score_final', 0)}/60｜"
+                f"{result.get('technical_judgement', '-')}｜"
+                f"R/R {_format_profit_loss_ratio(result.get('risk_reward'))}"
+            )
+            with st.expander(title, expanded=False):
+                _render_technical_score_detail(result)
+
+    if fetch_errors:
+        with st.expander("日足データ取得失敗一覧", expanded=True):
+            st.warning("取得失敗の理由を表示しています。error_type / error_message が空にならないように記録しています。")
+            st.dataframe(_safe_dataframe(_daily_fetch_error_table(fetch_errors)), width="stretch", hide_index=True)
 
 
 def _render_trades() -> None:

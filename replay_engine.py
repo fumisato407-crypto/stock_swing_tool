@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from daily_technical import get_replay_technical_config, score_technical_item
 from entry_rules import evaluate_intraday_entry
 from multi_timeframe_rules import build_replay_daily_context, evaluate_multi_timeframe_signal, evaluate_risk_filter
+from replay_cache import (
+    TECHNICAL_SCORE_FEATURE_VERSION,
+    get_cached_technical_score,
+    set_cached_technical_score,
+    technical_score_cache_key,
+)
 
 
 INTERVAL_MAX_HOLD_BARS = {
@@ -17,10 +25,27 @@ INTERVAL_MAX_HOLD_BARS = {
     "1d": 5,
 }
 DEFAULT_REPLAY_SHARES = 100
+CANDIDATE_MODE_EXISTING = "existing"
+CANDIDATE_MODE_TECHNICAL_ONLY = "technical_only"
+CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL = "existing_plus_technical"
+CANDIDATE_MODE_LABELS = {
+    CANDIDATE_MODE_EXISTING: "既存ロジック",
+    CANDIDATE_MODE_TECHNICAL_ONLY: "テクニカルのみ",
+    CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL: "既存ロジック＋テクニカル",
+}
+_CANDIDATE_MODE_ALIASES = {
+    "既存ロジック": CANDIDATE_MODE_EXISTING,
+    "テクニカルのみ": CANDIDATE_MODE_TECHNICAL_ONLY,
+    "既存ロジック＋テクニカル": CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+    "existing": CANDIDATE_MODE_EXISTING,
+    "technical_only": CANDIDATE_MODE_TECHNICAL_ONLY,
+    "existing_plus_technical": CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL,
+}
 
 
 @dataclass
 class ReplayRuleConfig:
+    candidate_generation_mode: str = CANDIDATE_MODE_EXISTING
     min_score: int = 70
     target_rule: str = "すべて"
     max_trades: int = 10
@@ -37,6 +62,15 @@ class ReplayRuleConfig:
     max_stop_loss_pct: float = 3.0
     max_loss_yen_limit: float = 20000.0
     min_risk_reward: float = 1.2
+    use_technical_score: bool = False
+    technical_preset: str = "standard_swing"
+    technical_min_score: int = 0
+    technical_min_confidence: int = 0
+    technical_show_breakdown: bool = True
+    technical_config: Dict[str, Any] = field(default_factory=get_replay_technical_config)
+    use_replay_cache: bool = True
+    feature_version: str = TECHNICAL_SCORE_FEATURE_VERSION
+    one_position_per_symbol: bool = False
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -69,6 +103,9 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
         return default if values.get(key) is None else int(values.get(key))
 
     return ReplayRuleConfig(
+        candidate_generation_mode=_normalize_candidate_generation_mode(
+            values.get("candidate_generation_mode", CANDIDATE_MODE_EXISTING)
+        ),
         min_score=int(values.get("min_score", 70) or 70),
         target_rule=str(values.get("target_rule", "すべて") or "すべて"),
         max_trades=int(values.get("max_trades", 10) or 10),
@@ -85,7 +122,20 @@ def _normalize_rule_config(rule_config: Optional[Dict[str, Any] | ReplayRuleConf
         max_stop_loss_pct=float(values.get("max_stop_loss_pct", 3.0) or 3.0),
         max_loss_yen_limit=float(values.get("max_loss_yen_limit", 20000.0) or 20000.0),
         min_risk_reward=float(values.get("min_risk_reward", 1.2) or 1.2),
+        use_technical_score=bool(values.get("use_technical_score", False)),
+        technical_preset=str(values.get("technical_preset", "standard_swing") or "standard_swing"),
+        technical_min_score=int(values.get("technical_min_score", 0) or 0),
+        technical_min_confidence=int(values.get("technical_min_confidence", 0) or 0),
+        technical_show_breakdown=bool(values.get("technical_show_breakdown", True)),
+        technical_config=dict(values.get("technical_config") or get_replay_technical_config()),
+        use_replay_cache=bool(values.get("use_replay_cache", True)),
+        feature_version=str(values.get("feature_version", TECHNICAL_SCORE_FEATURE_VERSION) or TECHNICAL_SCORE_FEATURE_VERSION),
+        one_position_per_symbol=bool(values.get("one_position_per_symbol", False)),
     )
+
+
+def _normalize_candidate_generation_mode(value: Any) -> str:
+    return _CANDIDATE_MODE_ALIASES.get(str(value or "").strip(), CANDIDATE_MODE_EXISTING)
 
 
 def _multi_timeframe_config(config: ReplayRuleConfig) -> Dict[str, Any]:
@@ -124,6 +174,183 @@ def _previous_session_low(history_df: pd.DataFrame, current_time: pd.Timestamp) 
     return float(previous["Low"].min())
 
 
+def _technical_config(config: ReplayRuleConfig) -> Dict[str, Any]:
+    technical_config = dict(config.technical_config or get_replay_technical_config())
+    technical_config["preset_name"] = config.technical_preset or technical_config.get("preset_name", "standard_swing")
+    return technical_config
+
+
+def _score_technical_for_history(
+    safe_history: pd.DataFrame,
+    current_ts: pd.Timestamp,
+    config: ReplayRuleConfig,
+    symbol: str,
+    name: str,
+    daily_df: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    technical_config = _technical_config(config)
+    key_info = technical_score_cache_key(
+        symbol=symbol,
+        decision_time=current_ts,
+        preset=config.technical_preset,
+        config=technical_config,
+        feature_version=config.feature_version,
+    )
+    if config.use_replay_cache:
+        cached = get_cached_technical_score(key_info)
+        if cached is not None:
+            return cached
+    started = time.perf_counter()
+    try:
+        technical_daily = build_replay_daily_context(safe_history, current_ts, prior_daily_df=daily_df)
+        feature_max_timestamp = _timestamp_text(technical_daily.index.max()) if not technical_daily.empty else ""
+        technical = score_technical_item(
+            technical_daily,
+            config=technical_config,
+            code=str(symbol).replace(".T", ""),
+            name=name,
+            normalized_symbol=symbol,
+        )
+        technical["_feature_max_timestamp"] = feature_max_timestamp
+        technical["_cache_hit"] = False
+        technical["_cache_key"] = key_info["key"]
+        technical["_config_hash"] = key_info["config_hash"]
+    except Exception as exc:
+        technical = {
+            "technical_preset": config.technical_preset,
+            "technical_score_raw": 0,
+            "penalty_score": 0,
+            "technical_score_final": 0,
+            "technical_judgement": "判定不可",
+            "confidence": 0,
+            "score_breakdown": {},
+            "penalty_reasons": [],
+            "hard_filter_reason": ["テクニカル採点失敗"],
+            "missing_data": ["technical_score_error"],
+            "technical_error": f"{exc.__class__.__name__}: {exc}",
+            "_feature_max_timestamp": "",
+            "_cache_hit": False,
+            "_cache_key": key_info["key"],
+            "_config_hash": key_info["config_hash"],
+        }
+    if config.use_replay_cache:
+        set_cached_technical_score(key_info, technical, elapsed_seconds=time.perf_counter() - started)
+    return technical
+
+
+def _attach_technical_fields(signal: Dict[str, Any], technical: Dict[str, Any], config: ReplayRuleConfig) -> None:
+    signal["technical"] = technical
+    signal["technical_preset"] = technical.get("technical_preset", config.technical_preset)
+    signal["technical_score_raw"] = technical.get("technical_score_raw")
+    signal["technical_penalty_score"] = technical.get("penalty_score")
+    signal["technical_score_final"] = technical.get("technical_score_final")
+    signal["technical_judgement"] = technical.get("technical_judgement")
+    signal["technical_confidence"] = technical.get("confidence")
+    signal["technical_score_breakdown"] = technical.get("score_breakdown", {})
+    signal["technical_penalty_reasons"] = technical.get("penalty_reasons", [])
+    signal["technical_hard_filter_reason"] = technical.get("hard_filter_reason", [])
+    signal["technical_missing_data"] = technical.get("missing_data", [])
+    signal["technical_stop_loss_candidate"] = technical.get("stop_loss_candidate")
+    signal["technical_target_price_candidate"] = technical.get("target_price_candidate")
+    signal["technical_risk_reward"] = technical.get("risk_reward")
+    signal["technical_hold_days_hint"] = technical.get("hold_days_hint")
+    signal["technical_buy_timing_hint"] = technical.get("buy_timing_hint")
+    if technical.get("technical_error"):
+        signal["technical_error"] = technical.get("technical_error")
+    signal["technical_cache_hit"] = bool(technical.get("_cache_hit"))
+    signal["technical_cache_key"] = technical.get("_cache_key")
+    signal["technical_config_hash"] = technical.get("_config_hash")
+    if technical.get("_feature_max_timestamp"):
+        signal["feature_max_timestamp"] = technical.get("_feature_max_timestamp")
+
+
+def _technical_reasons(technical: Dict[str, Any]) -> List[str]:
+    breakdown = technical.get("score_breakdown", {})
+    if not isinstance(breakdown, dict):
+        return []
+    reasons: List[str] = []
+    for section in ("trend", "entry_position", "volume", "candle", "breakout", "momentum", "risk_reward"):
+        values = breakdown.get(section, [])
+        if isinstance(values, list):
+            reasons.extend(str(item) for item in values[:2])
+    return reasons[:8]
+
+
+def _fallback_stop_loss(safe_history: pd.DataFrame, entry_price: float) -> Optional[float]:
+    technical_low = _num(safe_history.tail(12)["Low"].min(), 0)
+    if entry_price <= 0:
+        return None
+    if technical_low and technical_low < entry_price:
+        return float(round(technical_low))
+    return float(round(entry_price * 0.97))
+
+
+def _fallback_take_profit(entry_price: float, stop_loss: Optional[float]) -> Optional[float]:
+    if entry_price <= 0:
+        return None
+    if stop_loss and entry_price > stop_loss:
+        return float(round(entry_price + (entry_price - stop_loss) * 1.5))
+    return float(round(entry_price * 1.03))
+
+
+def _technical_only_signal(
+    safe_history: pd.DataFrame,
+    current_ts: pd.Timestamp,
+    config: ReplayRuleConfig,
+    symbol: str,
+    name: str,
+    daily_df: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    current_bar = safe_history.iloc[-1]
+    entry_price = _num(current_bar.get("Close"))
+    technical = _score_technical_for_history(safe_history, current_ts, config, symbol, name, daily_df)
+    stop_loss = technical.get("stop_loss_candidate") or _fallback_stop_loss(safe_history, entry_price)
+    take_profit = technical.get("target_price_candidate") or _fallback_take_profit(entry_price, stop_loss)
+    signal = {
+        "code": symbol,
+        "name": name,
+        "current_price": entry_price,
+        "judgement": "買い検討OK",
+        "signal_type": "テクニカルのみ",
+        "intraday_score": int(technical.get("technical_score_final", 0) or 0),
+        "score": int(technical.get("technical_score_final", 0) or 0),
+        "stop_loss": stop_loss,
+        "take_profit_1": take_profit,
+        "take_profit_2": _fallback_take_profit(entry_price, stop_loss),
+        "reasons": _technical_reasons(technical),
+        "candidate_generation_mode": CANDIDATE_MODE_TECHNICAL_ONLY,
+        "multi_timeframe_enabled": False,
+        "multi_timeframe_pass": None,
+        "daily_ok_count": None,
+        "daily_total_count": None,
+        "intraday_ok_count": None,
+        "intraday_total_count": None,
+        "risk_pass": None,
+        "buy_condition_json": {
+            "candidate_generation_mode": CANDIDATE_MODE_TECHNICAL_ONLY,
+            "technical_min_score": config.technical_min_score,
+            "technical_score_final": technical.get("technical_score_final"),
+            "technical_judgement": technical.get("technical_judgement"),
+            "technical_confidence": technical.get("confidence"),
+            "existing_logic_disabled": True,
+            "risk_filter_disabled": True,
+            "multi_timeframe_disabled": True,
+        },
+    }
+    _attach_technical_fields(signal, technical, config)
+    if int(technical.get("technical_score_final", 0) or 0) < int(config.technical_min_score):
+        signal["replay_skip_reason"] = "technical_score未満"
+        return signal
+    technical_config = _technical_config(config)
+    if technical_config.get("use_hard_filter", True) and technical.get("hard_filter_reason"):
+        signal["replay_skip_reason"] = "technical_hard_filter"
+        return signal
+    if int(technical.get("confidence", 0) or 0) < int(config.technical_min_confidence):
+        signal["replay_skip_reason"] = "technical_confidence未満"
+        return signal
+    return signal
+
+
 def evaluate_replay_step(
     history_df: pd.DataFrame,
     current_time: Any,
@@ -140,6 +367,9 @@ def evaluate_replay_step(
     safe_history = history_df.loc[history_df.index <= current_ts].copy()
     if len(safe_history) < 25:
         return {"judgement": "見送り", "intraday_score": 0, "reason": "判定に必要な履歴足が不足"}
+
+    if config.candidate_generation_mode == CANDIDATE_MODE_TECHNICAL_ONLY:
+        return _technical_only_signal(safe_history, current_ts, config, symbol, name, daily_df)
 
     signal = evaluate_intraday_entry(
         code=symbol,
@@ -178,6 +408,7 @@ def evaluate_replay_step(
         signal["intraday_entry_json"] = signal["intraday_entry"]
         signal["multi_timeframe_detail"] = mtf.get("detail_json", {})
         signal["reasons"] = list(dict.fromkeys(list(signal.get("reasons", [])) + list(mtf.get("reasons", []))))
+
     risk_filter = evaluate_risk_filter(signal, shares=config.shares, config=_risk_filter_config(config))
     signal["risk_filter"] = risk_filter
     signal["risk_filter_json"] = risk_filter.get("risk_filter_json", risk_filter)
@@ -203,6 +434,20 @@ def evaluate_replay_step(
     if signal.get("judgement") not in {"買い検討OK", "監視強化"}:
         signal["replay_skip_reason"] = "買い判定未達"
         return signal
+    signal["existing_logic_pass"] = True
+    if config.candidate_generation_mode == CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL:
+        technical_config = _technical_config(config)
+        technical = _score_technical_for_history(safe_history, current_ts, config, symbol, name, daily_df)
+        _attach_technical_fields(signal, technical, config)
+        if int(technical.get("technical_score_final", 0) or 0) < int(config.technical_min_score):
+            signal["replay_skip_reason"] = "technical_score_below_min"
+            return signal
+        if technical_config.get("use_hard_filter", True) and technical.get("hard_filter_reason"):
+            signal["replay_skip_reason"] = "technical_hard_filter"
+            return signal
+        if int(technical.get("confidence", 0) or 0) < int(config.technical_min_confidence):
+            signal["replay_skip_reason"] = "technical_confidence_below_min"
+            return signal
     return signal
 
 
@@ -215,7 +460,16 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "take_profit": signal.get("take_profit_1"),
         "score": int(signal.get("intraday_score", 0) or 0),
         "entry_type": signal.get("signal_type", "-"),
-        "rule_name": "intraday_replay_rule",
+        "rule_name": (
+            "technical_only_replay_rule"
+            if signal.get("candidate_generation_mode") == CANDIDATE_MODE_TECHNICAL_ONLY
+            else "intraday_replay_rule"
+        ),
+        "candidate_generation_mode": signal.get("candidate_generation_mode"),
+        "decision_time": _timestamp_text(current_time),
+        "feature_max_timestamp": signal.get("feature_max_timestamp") or _timestamp_text(current_time),
+        "technical_cache_hit": signal.get("technical_cache_hit"),
+        "technical_config_hash": signal.get("technical_config_hash"),
         "daily_ok_count": signal.get("daily_ok_count"),
         "daily_total_count": signal.get("daily_total_count"),
         "daily_score": signal.get("daily_score"),
@@ -236,6 +490,21 @@ def create_replay_trade(signal: Dict[str, Any], current_bar: pd.Series, current_
         "risk_filter_json": signal.get("risk_filter_json", signal.get("risk_filter", {})),
         "risk_reasons": signal.get("risk_reasons", []),
         "buy_condition_json": signal.get("buy_condition_json", {}),
+        "technical_preset": signal.get("technical_preset"),
+        "technical_score_raw": signal.get("technical_score_raw"),
+        "technical_penalty_score": signal.get("technical_penalty_score"),
+        "technical_score_final": signal.get("technical_score_final"),
+        "technical_judgement": signal.get("technical_judgement"),
+        "technical_confidence": signal.get("technical_confidence"),
+        "technical_score_breakdown": signal.get("technical_score_breakdown", {}),
+        "technical_penalty_reasons": signal.get("technical_penalty_reasons", []),
+        "technical_hard_filter_reason": signal.get("technical_hard_filter_reason", []),
+        "technical_missing_data": signal.get("technical_missing_data", []),
+        "technical_stop_loss_candidate": signal.get("technical_stop_loss_candidate"),
+        "technical_target_price_candidate": signal.get("technical_target_price_candidate"),
+        "technical_risk_reward": signal.get("technical_risk_reward"),
+        "technical_hold_days_hint": signal.get("technical_hold_days_hint"),
+        "technical_buy_timing_hint": signal.get("technical_buy_timing_hint"),
         "signal": {
             key: value
             for key, value in signal.items()
@@ -384,6 +653,157 @@ def evaluate_replay_trade_outcome(
     return result
 
 
+def empty_replay_stage_counts(symbols_count: int = 1) -> Dict[str, Any]:
+    return {
+        "scan_count": 0,
+        "scan_total_count": 0,
+        "target_symbols_count": int(symbols_count or 0),
+        "existing_logic_checked_count": 0,
+        "existing_logic_pass_count": 0,
+        "existing_logic_reject_count": 0,
+        "technical_score_checked_count": 0,
+        "technical_score_pass_count": 0,
+        "technical_score_reject_count": 0,
+        "hard_filter_reject_count": 0,
+        "technical_score_attempt_count": 0,
+        "technical_score_success_count": 0,
+        "technical_min_score_pass_count": 0,
+        "technical_hard_filter_excluded_count": 0,
+        "technical_confidence_excluded_count": 0,
+        "raw_signal_count": 0,
+        "cooldown_filtered_count": 0,
+        "max_trades_excluded_count": 0,
+        "position_open_excluded_count": 0,
+        "final_virtual_buy_count": 0,
+        "settled_trade_count": 0,
+        "existing_min_score_pass_count": 0,
+        "target_filter_pass_count": 0,
+        "intraday_entry_pass_count": 0,
+        "use_conditions_pass_count": 0,
+        "risk_filter_pass_count": 0,
+        "cache_hit_count": 0,
+        "cache_miss_count": 0,
+        "leak_check_ok_count": 0,
+        "leak_check_ng_count": 0,
+        "skip_reasons": {},
+    }
+
+
+def update_replay_stage_counts(
+    stage_counts: Dict[str, Any],
+    signal: Dict[str, Any],
+    config: Dict[str, Any] | ReplayRuleConfig,
+) -> None:
+    normalized = _normalize_rule_config(config)
+    skip_reason = signal.get("replay_skip_reason")
+    if skip_reason:
+        reasons = stage_counts.setdefault("skip_reasons", {})
+        reasons[str(skip_reason)] = int(reasons.get(str(skip_reason), 0)) + 1
+
+    mode = normalized.candidate_generation_mode
+    has_technical = signal.get("technical_score_final") not in (None, "") or bool(signal.get("technical_error"))
+    if mode != CANDIDATE_MODE_TECHNICAL_ONLY:
+        stage_counts["existing_logic_checked_count"] = int(stage_counts.get("existing_logic_checked_count", 0)) + 1
+        if bool(signal.get("existing_logic_pass")):
+            stage_counts["existing_logic_pass_count"] = int(stage_counts.get("existing_logic_pass_count", 0)) + 1
+        else:
+            stage_counts["existing_logic_reject_count"] = int(stage_counts.get("existing_logic_reject_count", 0)) + 1
+
+    if has_technical:
+        stage_counts["technical_score_checked_count"] = int(stage_counts.get("technical_score_checked_count", 0)) + 1
+        stage_counts["technical_score_attempt_count"] = int(stage_counts.get("technical_score_attempt_count", 0)) + 1
+        if signal.get("technical_cache_hit"):
+            stage_counts["cache_hit_count"] = int(stage_counts.get("cache_hit_count", 0)) + 1
+        else:
+            stage_counts["cache_miss_count"] = int(stage_counts.get("cache_miss_count", 0)) + 1
+        if not signal.get("technical_error"):
+            stage_counts["technical_score_success_count"] = int(stage_counts.get("technical_score_success_count", 0)) + 1
+        if int(signal.get("technical_score_final", 0) or 0) >= int(normalized.technical_min_score):
+            stage_counts["technical_score_pass_count"] = int(stage_counts.get("technical_score_pass_count", 0)) + 1
+            stage_counts["technical_min_score_pass_count"] = int(stage_counts.get("technical_min_score_pass_count", 0)) + 1
+        elif not signal.get("technical_error"):
+            stage_counts["technical_score_reject_count"] = int(stage_counts.get("technical_score_reject_count", 0)) + 1
+        if skip_reason == "technical_hard_filter":
+            stage_counts["hard_filter_reject_count"] = int(stage_counts.get("hard_filter_reject_count", 0)) + 1
+            stage_counts["technical_hard_filter_excluded_count"] = int(stage_counts.get("technical_hard_filter_excluded_count", 0)) + 1
+        if skip_reason in {"technical_confidence未満", "technical_confidence_below_min"}:
+            stage_counts["technical_score_reject_count"] = int(stage_counts.get("technical_score_reject_count", 0)) + 1
+            stage_counts["technical_confidence_excluded_count"] = int(stage_counts.get("technical_confidence_excluded_count", 0)) + 1
+
+    if mode != CANDIDATE_MODE_TECHNICAL_ONLY:
+        if int(signal.get("intraday_score", 0) or 0) >= int(normalized.min_score):
+            stage_counts["existing_min_score_pass_count"] = int(stage_counts.get("existing_min_score_pass_count", 0)) + 1
+        judgement = signal.get("judgement")
+        if judgement in {"買い検討OK", "監視強化"}:
+            stage_counts["target_filter_pass_count"] = int(stage_counts.get("target_filter_pass_count", 0)) + 1
+        if int(signal.get("intraday_ok_count", 0) or 0) >= int(normalized.intraday_min_ok):
+            stage_counts["intraday_entry_pass_count"] = int(stage_counts.get("intraday_entry_pass_count", 0)) + 1
+        if bool(signal.get("multi_timeframe_pass")) or not normalized.use_multi_timeframe:
+            stage_counts["use_conditions_pass_count"] = int(stage_counts.get("use_conditions_pass_count", 0)) + 1
+        if bool(signal.get("risk_pass")) or not normalized.use_risk_filter:
+            stage_counts["risk_filter_pass_count"] = int(stage_counts.get("risk_filter_pass_count", 0)) + 1
+
+
+def leak_check_for_trade(trade: Dict[str, Any], outcome_start_timestamp: Any = None) -> Dict[str, str]:
+    decision = trade.get("decision_time") or trade.get("signal_time")
+    feature_max = trade.get("feature_max_timestamp") or decision
+    outcome_start = outcome_start_timestamp or trade.get("outcome_start_timestamp")
+    reasons: List[str] = []
+    ok = True
+    try:
+        decision_ts = pd.Timestamp(decision)
+        feature_ts = pd.Timestamp(feature_max)
+        if feature_ts > decision_ts:
+            ok = False
+            reasons.append("feature_max_timestampがdecision_timeより後です")
+    except Exception:
+        ok = False
+        reasons.append("decision_timeまたはfeature_max_timestampを解釈できません")
+    if outcome_start:
+        try:
+            outcome_ts = pd.Timestamp(outcome_start)
+            decision_ts = pd.Timestamp(decision)
+            if outcome_ts <= decision_ts:
+                ok = False
+                reasons.append("outcome_start_timestampがdecision_time以下です")
+        except Exception:
+            ok = False
+            reasons.append("outcome_start_timestampを解釈できません")
+    return {
+        "leak_check_result": "OK" if ok else "NG",
+        "leak_check_reason": " / ".join(reasons) if reasons else "feature<=decision and outcome>decision",
+    }
+
+
+def replay_zero_trade_reasons(stage_counts: Dict[str, Any], mode: str) -> List[str]:
+    if int(stage_counts.get("final_virtual_buy_count", 0) or 0) > 0:
+        return []
+    reasons: List[str] = []
+    normalized_mode = _normalize_candidate_generation_mode(mode)
+    if normalized_mode in {CANDIDATE_MODE_TECHNICAL_ONLY, CANDIDATE_MODE_EXISTING_PLUS_TECHNICAL}:
+        attempts = int(stage_counts.get("technical_score_attempt_count", 0) or 0)
+        if attempts <= 0:
+            reasons.append("テクニカル採点自体が実行されていません。")
+        elif int(stage_counts.get("technical_min_score_pass_count", 0) or 0) <= 0:
+            reasons.append("テクニカル採点は実行されましたが、最小テクニカルスコアを1件も通過しませんでした。")
+        if int(stage_counts.get("technical_hard_filter_excluded_count", 0) or 0) >= max(1, attempts):
+            reasons.append("テクニカル強制見送り条件で全件除外されました。")
+    if normalized_mode != CANDIDATE_MODE_TECHNICAL_ONLY:
+        if int(stage_counts.get("existing_logic_checked_count", 0) or 0) <= 0:
+            reasons.append("既存ロジックの判定自体が実行されていません。")
+        elif int(stage_counts.get("existing_logic_pass_count", 0) or 0) <= 0:
+            reasons.append("既存ロジックを通過した候補が1件もありませんでした。")
+        if int(stage_counts.get("existing_min_score_pass_count", 0) or 0) <= 0:
+            reasons.append("既存の最小スコア条件で全件除外された可能性があります。")
+        if int(stage_counts.get("intraday_entry_pass_count", 0) or 0) <= 0:
+            reasons.append("既存の5分足エントリー判定で全件除外された可能性があります。")
+        if int(stage_counts.get("risk_filter_pass_count", 0) or 0) <= 0:
+            reasons.append("リスク条件で全件除外された可能性があります。")
+    if not reasons:
+        reasons.append("候補は出ましたが、連続シグナル抑制または最大仮想買い件数制限で最終0件になった可能性があります。")
+    return reasons
+
+
 def run_replay(
     symbol: str,
     df: pd.DataFrame,
@@ -395,9 +815,16 @@ def run_replay(
 ) -> Dict[str, Any]:
     config = _normalize_rule_config(rule_config)
     if df is None or df.empty:
+        stage_counts = empty_replay_stage_counts(1)
         return {
             "trades": [],
-            "summary": summarize_replay_results([]) | {"evaluated_steps": 0, "error": "過去データが空です。"},
+            "summary": summarize_replay_results([]) | {
+                "evaluated_steps": 0,
+                "error": "過去データが空です。",
+                "candidate_generation_mode": config.candidate_generation_mode,
+                "stage_counts": stage_counts,
+                "zero_trade_reasons": ["過去データが空のため、候補判定を実行できませんでした。"],
+            },
         }
 
     data = df.copy().sort_index()
@@ -410,24 +837,50 @@ def run_replay(
     evaluated_steps = 0
     last_trade_index = -10**9
     all_data = df.copy().sort_index()
+    stage_counts = empty_replay_stage_counts(1)
+    position_open_until: Optional[pd.Timestamp] = None
 
     for position, (current_time, current_bar) in enumerate(data.iterrows()):
         global_position = all_data.index.get_indexer([current_time])[0]
         if global_position < 24:
             continue
-        if len(trades) >= config.max_trades:
-            break
-        if position - last_trade_index < config.cooldown_bars:
-            continue
-
         history = all_data.loc[all_data.index <= current_time]
         signal = evaluate_replay_step(history, current_time, config, symbol=symbol, name=name, daily_df=daily_df)
         evaluated_steps += 1
+        stage_counts["scan_count"] = evaluated_steps
+        stage_counts["scan_total_count"] = evaluated_steps
+        update_replay_stage_counts(stage_counts, signal, config)
         if signal.get("replay_skip_reason") or signal.get("judgement") not in {"買い検討OK", "監視強化"}:
+            continue
+
+        stage_counts["raw_signal_count"] = int(stage_counts.get("raw_signal_count", 0)) + 1
+        if position - last_trade_index < config.cooldown_bars:
+            stage_counts["cooldown_filtered_count"] = int(stage_counts.get("cooldown_filtered_count", 0)) + 1
+            reasons = stage_counts.setdefault("skip_reasons", {})
+            reasons["cooldown_recent"] = int(reasons.get("cooldown_recent", 0)) + 1
+            continue
+        if config.one_position_per_symbol and position_open_until is not None and pd.Timestamp(current_time) <= position_open_until:
+            stage_counts["position_open_excluded_count"] = int(stage_counts.get("position_open_excluded_count", 0)) + 1
+            reasons = stage_counts.setdefault("skip_reasons", {})
+            reasons["position_open"] = int(reasons.get("position_open", 0)) + 1
+            continue
+        if len(trades) >= config.max_trades:
+            stage_counts["max_trades_excluded_count"] = int(stage_counts.get("max_trades_excluded_count", 0)) + 1
+            reasons = stage_counts.setdefault("skip_reasons", {})
+            reasons["max_trades"] = int(reasons.get("max_trades", 0)) + 1
             continue
 
         trade = create_replay_trade(signal, current_bar, current_time)
         future = all_data.loc[all_data.index > current_time]
+        outcome_start = _timestamp_text(future.index[0]) if not future.empty else ""
+        trade["outcome_start_timestamp"] = outcome_start
+        trade.update(leak_check_for_trade(trade, outcome_start))
+        if trade.get("leak_check_result") == "NG":
+            stage_counts["leak_check_ng_count"] = int(stage_counts.get("leak_check_ng_count", 0)) + 1
+            reasons = stage_counts.setdefault("skip_reasons", {})
+            reasons["leak_check_ng"] = int(reasons.get("leak_check_ng", 0)) + 1
+            continue
+        stage_counts["leak_check_ok_count"] = int(stage_counts.get("leak_check_ok_count", 0)) + 1
         trade.update(
             evaluate_replay_trade_outcome(
                 trade,
@@ -446,13 +899,37 @@ def run_replay(
             }
         )
         trades.append(trade)
+        stage_counts["final_virtual_buy_count"] = len(trades)
+        exit_reference = trade.get("exit_time") or trade.get("evaluated_until")
+        if exit_reference:
+            try:
+                position_open_until = pd.Timestamp(exit_reference)
+            except Exception:
+                position_open_until = None
         last_trade_index = position
 
     summary = summarize_replay_results(trades)
+    settled_count = sum(
+        1
+        for trade in trades
+        if trade.get("status") == "closed" and trade.get("exit_price") is not None
+    )
+    stage_counts["final_virtual_buy_count"] = len(trades)
+    stage_counts["settled_trade_count"] = settled_count
     summary["evaluated_steps"] = evaluated_steps
     summary["data_rows"] = len(data)
     summary["first_timestamp"] = _timestamp_text(data.index[0]) if not data.empty else "-"
     summary["last_timestamp"] = _timestamp_text(data.index[-1]) if not data.empty else "-"
+    summary["candidate_generation_mode"] = config.candidate_generation_mode
+    summary["raw_signal_count"] = stage_counts.get("raw_signal_count", 0)
+    summary["cooldown_filtered_count"] = stage_counts.get("cooldown_filtered_count", 0)
+    summary["position_filtered_count"] = stage_counts.get("position_open_excluded_count", 0)
+    summary["max_trade_filtered_count"] = stage_counts.get("max_trades_excluded_count", 0)
+    summary["final_trade_count"] = len(trades)
+    summary["settled_trade_count"] = settled_count
+    summary["csv_export_count"] = len(trades)
+    summary["stage_counts"] = stage_counts
+    summary["zero_trade_reasons"] = replay_zero_trade_reasons(stage_counts, config.candidate_generation_mode)
     return {"trades": trades, "summary": summary}
 
 
