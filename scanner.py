@@ -104,6 +104,15 @@ def _apply_multi_timeframe_result(
     decision = str(mtf.get("decision_category", "avoid"))
     daily_filter = mtf.get("daily_filter", {})
     intraday_entry = mtf.get("intraday_entry", {})
+    intraday_available = bool(intraday_entry.get("intraday_available", True)) and not intraday_error_type
+    if not intraday_available:
+        intraday_entry = dict(intraday_entry)
+        intraday_entry["intraday_available"] = False
+        intraday_entry["intraday_data_status"] = "データなし"
+        intraday_entry["intraday_ok_display"] = "データなし"
+        intraday_entry["intraday_pass"] = None
+        intraday_entry["fetch_error_type"] = intraday_error_type or "empty_dataframe"
+        intraday_entry["fetch_error_message"] = intraday_error_message or "5分足データが空です"
     base_score = int(signal.get("score", 0) or 0)
     risk_filter = evaluate_risk_filter(
         signal,
@@ -132,6 +141,12 @@ def _apply_multi_timeframe_result(
         entry_type = "リスク条件NG"
         wait_condition = "損切り幅、最大損失、損益比の改善待ち"
         monitoring_reason = "リスク条件NG: " + "、".join(risk_filter.get("risk_reasons", []))
+    elif not intraday_available and bool(daily_filter.get("daily_pass")):
+        category = "監視"
+        score = min(BUY_SCORE_THRESHOLD - 1, max(WATCH_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score)))
+        entry_type = "5分足データ取得失敗"
+        wait_condition = "5分足データ取得待ち"
+        monitoring_reason = intraday_error_message or "5分足データが空です"
     elif bool(daily_filter.get("daily_pass")):
         category = "監視"
         score = min(BUY_SCORE_THRESHOLD - 1, max(WATCH_SCORE_THRESHOLD, int(mtf.get("score", base_score) or base_score)))
@@ -164,10 +179,13 @@ def _apply_multi_timeframe_result(
             "daily_score": daily_filter.get("daily_score", daily_score_from_filter(daily_filter)),
             "intraday_ok_count": intraday_entry.get("intraday_ok_count", 0),
             "intraday_total_count": intraday_entry.get("intraday_total_count", 4),
+            "intraday_ok_display": intraday_entry.get("intraday_ok_display"),
             "daily_filter_json": daily_filter,
             "intraday_entry_json": intraday_entry,
             "multi_timeframe_detail": mtf.get("detail_json", {}),
             "multi_timeframe_reasons": mtf.get("reasons", []),
+            "multi_timeframe_status": "判定不可" if not intraday_available else ("OK" if mtf.get("multi_timeframe_pass") else "NG"),
+            "reject_reason": intraday_error_message if not intraday_available else "",
             "intraday_error_type": intraday_error_type,
             "intraday_error_message": intraday_error_message,
             "risk_filter": risk_filter,

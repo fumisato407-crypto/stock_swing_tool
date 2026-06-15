@@ -26,7 +26,7 @@ from config import (
 from data_fetcher import fetch_price_data, normalize_jp_symbol
 from historical_scan_replay import HistoricalScanReplayConfig, run_historical_scan_replay
 from historical_data import HistoricalDataResult, YFINANCE_AUTO_ADJUST, load_or_fetch_historical_data, validate_historical_ohlcv
-from intraday_scanner import fetch_intraday_data, scan_intraday_entries
+from intraday_scanner import fetch_intraday_data, run_raw_intraday_fetch_test, scan_intraday_entries
 from market_hours import is_market_open_jst, market_status_label, next_market_open_hint, now_jst as market_now_jst
 from notifier import format_yen
 from outcome_tracker import update_open_virtual_trade_outcomes
@@ -124,6 +124,12 @@ INTRADAY_TABLE_COLUMNS = [
     "error_type",
     "error_message",
     "fetched_rows",
+    "intraday_rows",
+    "latest_5m_jst",
+    "latest_close",
+    "latest_volume",
+    "vwap",
+    "cache_hit",
     "last_attempt_at",
 ]
 
@@ -560,6 +566,12 @@ def _make_intraday_chart(signal: Dict[str, Any]) -> go.Figure:
 def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for signal in signals:
+        intraday_ok_display = signal.get("intraday_ok_display")
+        if not intraday_ok_display:
+            intraday_ok_display = f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}"
+        multi_timeframe_display = signal.get("multi_timeframe_status")
+        if not multi_timeframe_display:
+            multi_timeframe_display = "OK" if signal.get("multi_timeframe_pass") else "NG"
         rows.append(
             {
                 "code": signal.get("code", ""),
@@ -573,8 +585,8 @@ def _compact_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
                 ),
                 "daily_score": _format_score_value(signal.get("daily_score")),
                 "daily_ok": f"{signal.get('daily_ok_count', '-')}/{signal.get('daily_total_count', '-')}",
-                "intraday_ok": f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
-                "multi_timeframe": "OK" if signal.get("multi_timeframe_pass") else "NG",
+                "intraday_ok": intraday_ok_display,
+                "multi_timeframe": multi_timeframe_display,
                 "entry_type": signal.get("entry_type", "-"),
                 "expected_value_label": signal.get("expected_value_label", "-"),
                 "risk_reward": _format_rr(signal),
@@ -661,10 +673,141 @@ def _intraday_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
                 "error_type": signal.get("error_type", ""),
                 "error_message": signal.get("error_message", signal.get("error", "")),
                 "fetched_rows": signal.get("fetched_rows", ""),
+                "intraday_rows": signal.get("intraday_rows", signal.get("fetched_rows", "")),
+                "latest_5m_jst": signal.get("latest_5m_jst", signal.get("last_time", "")),
+                "latest_close": format_yen(signal.get("latest_close", signal.get("current_price"))),
+                "latest_volume": signal.get("latest_volume", signal.get("current_volume", "")),
+                "vwap": format_yen(signal.get("vwap")),
+                "cache_hit": signal.get("cache_hit", False),
                 "last_attempt_at": signal.get("last_attempt_at", ""),
             }
         )
     return pd.DataFrame(rows, columns=INTRADAY_TABLE_COLUMNS)
+
+
+def _intraday_fetch_debug_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for signal in signals:
+        rows.append(
+            {
+                "code": signal.get("code", ""),
+                "ticker_for_intraday": signal.get("ticker_for_intraday", signal.get("normalized_symbol", "")),
+                "normalized_symbol": signal.get("normalized_symbol", ""),
+                "intraday_fetch_ok": signal.get("intraday_fetch_ok", False),
+                "intraday_rows": signal.get("intraday_rows", signal.get("fetched_rows", 0)),
+                "latest_5m_jst": signal.get("latest_5m_jst", signal.get("last_time", "-")),
+                "latest_close": format_yen(signal.get("latest_close", signal.get("current_price"))),
+                "latest_volume": signal.get("latest_volume", signal.get("current_volume", "-")),
+                "vwap": format_yen(signal.get("vwap")),
+                "fetch_error_type": signal.get("error_type", ""),
+                "fetch_error_message": signal.get("error_message", signal.get("error", "")),
+                "cache_hit": signal.get("cache_hit", False),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "code",
+            "ticker_for_intraday",
+            "normalized_symbol",
+            "intraday_fetch_ok",
+            "intraday_rows",
+            "latest_5m_jst",
+            "latest_close",
+            "latest_volume",
+            "vwap",
+            "fetch_error_type",
+            "fetch_error_message",
+            "cache_hit",
+        ],
+    )
+
+
+def _intraday_recent_bar_table(signal: Dict[str, Any]) -> pd.DataFrame:
+    data = signal.get("data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame(
+            columns=[
+                "bar_time_jst",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "vwap",
+                "is_bullish",
+                "close_above_vwap",
+                "volume_spike_ok",
+                "high_break_ok",
+                "pullback_rebound_ok",
+                "five_min_bar_ok",
+                "ng_reason",
+            ]
+        )
+    frame = data.copy().sort_index()
+    if "vwap" not in frame.columns:
+        typical = (frame["High"] + frame["Low"] + frame["Close"]) / 3
+        volume = frame["Volume"].fillna(0).clip(lower=0)
+        frame["vwap"] = ((typical * volume).cumsum() / volume.cumsum().replace(0, pd.NA)).fillna(
+            typical.expanding(min_periods=1).mean()
+        )
+    rows = []
+    for pos, (ts, row) in enumerate(frame.tail(4).iterrows()):
+        loc = frame.index.get_loc(ts)
+        if isinstance(loc, slice):
+            loc = loc.stop - 1
+        prior = frame.iloc[: int(loc)] if int(loc) > 0 else pd.DataFrame()
+        prior_high = float(prior["High"].tail(12).max()) if not prior.empty else None
+        avg_volume = float(prior["Volume"].tail(12).mean()) if not prior.empty else None
+        previous_close = float(frame.iloc[int(loc) - 1]["Close"]) if int(loc) > 0 else None
+        close = _to_float(row.get("Close"))
+        high = _to_float(row.get("High"))
+        low = _to_float(row.get("Low"))
+        open_price = _to_float(row.get("Open"))
+        volume_value = _to_float(row.get("Volume"), 0) or 0
+        vwap = _to_float(row.get("vwap"))
+        is_bullish = close is not None and open_price is not None and close >= open_price
+        close_above_vwap = close is not None and vwap is not None and close > vwap
+        volume_spike_ok = avg_volume not in (None, 0) and volume_value >= avg_volume * 1.5
+        high_break_ok = prior_high not in (None, 0) and close is not None and close > prior_high
+        pullback_rebound_ok = (
+            low is not None
+            and close is not None
+            and previous_close is not None
+            and vwap is not None
+            and low <= vwap * 1.003
+            and close > vwap
+            and close > previous_close
+        )
+        five_min_bar_ok = bool(close_above_vwap and (high_break_ok or pullback_rebound_ok or volume_spike_ok))
+        ng_reasons = []
+        if not close_above_vwap:
+            ng_reasons.append("VWAP未達")
+        if not high_break_ok:
+            ng_reasons.append("高値突破なし")
+        if not pullback_rebound_ok:
+            ng_reasons.append("押し目反発なし")
+        if not volume_spike_ok:
+            ng_reasons.append("出来高急増なし")
+        rows.append(
+            {
+                "bar_time_jst": ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts),
+                "open": format_yen(open_price),
+                "high": format_yen(high),
+                "low": format_yen(low),
+                "close": format_yen(close),
+                "volume": int(volume_value),
+                "vwap": format_yen(vwap),
+                "is_bullish": "OK" if is_bullish else "NG",
+                "close_above_vwap": "OK" if close_above_vwap else "NG",
+                "volume_spike_ok": "OK" if volume_spike_ok else "NG",
+                "high_break_ok": "OK" if high_break_ok else "NG",
+                "pullback_rebound_ok": "OK" if pullback_rebound_ok else "NG",
+                "five_min_bar_ok": "OK" if five_min_bar_ok else "NG",
+                "ng_reason": "、".join(ng_reasons) if ng_reasons else "-",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _failure_debug_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
@@ -673,16 +816,35 @@ def _failure_debug_table(signals: Iterable[Dict[str, Any]]) -> pd.DataFrame:
         rows.append(
             {
                 "code": signal.get("raw_code") or signal.get("code", ""),
+                "ticker_for_intraday": signal.get("ticker_for_intraday", signal.get("normalized_symbol", "")),
                 "normalized_symbol": signal.get("normalized_symbol", ""),
                 "error_type": signal.get("error_type", ""),
                 "error_message": signal.get("error_message", signal.get("error", signal.get("comment", ""))),
                 "fetched_rows": signal.get("fetched_rows", 0),
+                "intraday_rows": signal.get("intraday_rows", signal.get("fetched_rows", 0)),
+                "latest_5m_jst": signal.get("latest_5m_jst", "-"),
+                "latest_close": format_yen(signal.get("latest_close")),
+                "latest_volume": signal.get("latest_volume", "-"),
+                "vwap": format_yen(signal.get("vwap")),
                 "last_attempt_at": signal.get("last_attempt_at", ""),
             }
         )
     return pd.DataFrame(
         rows,
-        columns=["code", "normalized_symbol", "error_type", "error_message", "fetched_rows", "last_attempt_at"],
+        columns=[
+            "code",
+            "ticker_for_intraday",
+            "normalized_symbol",
+            "error_type",
+            "error_message",
+            "fetched_rows",
+            "intraday_rows",
+            "latest_5m_jst",
+            "latest_close",
+            "latest_volume",
+            "vwap",
+            "last_attempt_at",
+        ],
     )
 
 
@@ -818,25 +980,34 @@ def _daily_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool | 
 def _intraday_condition_rows(signal: Dict[str, Any]) -> Tuple[pd.DataFrame, bool | None]:
     saved = signal.get("intraday_entry") or signal.get("intraday_entry_json")
     if isinstance(saved, dict) and saved:
+        if saved.get("intraday_available") is False or saved.get("intraday_data_status") in {"データなし", "データ不足"}:
+            reason = saved.get("fetch_error_message") or saved.get("reason") or "5分足データが空です"
+            rows = [
+                {"条件": "VWAP上", "判定": "データなし", "補足": reason},
+                {"条件": "直近高値突破", "判定": "データなし", "補足": "過去高値 N/A"},
+                {"条件": "押し目反発", "判定": "データなし", "補足": "判定不可"},
+                {"条件": "出来高急増", "判定": "データなし", "補足": "出来高 N/A / 平均 N/A"},
+            ]
+            return _condition_table(rows), None
         rows = [
             {
                 "条件": "VWAP上",
-                "判定": _condition_status(bool(saved.get("vwap_ok"))),
+                "判定": _condition_status(saved.get("vwap_ok")),
                 "補足": f"現在値 {format_yen(saved.get('current_close'))} / VWAP {format_yen(saved.get('vwap'))}",
             },
             {
                 "条件": "直近高値突破",
-                "判定": _condition_status(bool(saved.get("breakout_ok"))),
+                "判定": _condition_status(saved.get("breakout_ok")),
                 "補足": f"過去高値 {format_yen(saved.get('past_n_bars_high'))}",
             },
             {
                 "条件": "押し目反発",
-                "判定": _condition_status(bool(saved.get("pullback_rebound_ok"))),
+                "判定": _condition_status(saved.get("pullback_rebound_ok")),
                 "補足": "VWAP付近への押し後に再上抜け",
             },
             {
                 "条件": "出来高急増",
-                "判定": _condition_status(bool(saved.get("intraday_volume_spike_ok"))),
+                "判定": _condition_status(saved.get("intraday_volume_spike_ok")),
                 "補足": f"出来高 {int(_to_float(saved.get('current_volume'), 0) or 0):,} / 平均 {int(_to_float(saved.get('avg_volume_12bars'), 0) or 0):,}",
             },
         ]
@@ -941,6 +1112,8 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     intraday_df, intraday_ok = _intraday_condition_rows(signal)
     risk_df, risk_ok = _risk_condition_rows(signal)
     condition = signal.get("buy_condition_json") if isinstance(signal.get("buy_condition_json"), dict) else {}
+    intraday_ok_display = signal.get("intraday_ok_display") or f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}"
+    mtf_status = signal.get("multi_timeframe_status") or signal.get("category") or signal.get("judgement", "-")
     metric_cols = st.columns(7)
     metric_cols[0].metric(
         "日足",
@@ -948,14 +1121,16 @@ def _render_judgement_breakdown(signal: Dict[str, Any]) -> None:
     )
     metric_cols[1].metric(
         "5分足",
-        f"{signal.get('intraday_ok_count', '-')}/{signal.get('intraday_total_count', '-')}",
+        intraday_ok_display,
     )
     metric_cols[2].metric("日足順位", f"{signal.get('daily_rank_at_scan', '-')}/{signal.get('daily_rank_total', '-')}")
     metric_cols[3].metric("日足スコア", _format_score_value(signal.get("daily_score")))
     metric_cols[4].metric("上位N", _display_risk_pass(signal.get("daily_top_n_pass", condition.get("daily_top_n_pass"))))
     metric_cols[5].metric("最小スコア", _display_risk_pass(condition.get("min_score_pass")))
     metric_cols[6].metric("買い上限", _display_risk_pass(condition.get("max_buy_candidates_pass")))
-    st.caption(f"統合判定: {signal.get('category') or signal.get('judgement', '-')}")
+    st.caption(f"統合判定: {mtf_status}")
+    if signal.get("reject_reason"):
+        st.caption(f"判定不可理由: {signal.get('reject_reason')}")
     st.caption(_buy_condition_text(signal))
     cols = st.columns(3)
     with cols[0]:
@@ -1191,7 +1366,12 @@ def _render_details_tab(
 def _render_intraday_signal(signal: Dict[str, Any], key_prefix: str) -> None:
     if signal.get("judgement") == "取得失敗":
         st.warning(signal.get("error_message") or signal.get("error") or "場中データ取得に失敗しました。")
-        st.dataframe(_failure_debug_table([signal]), width="stretch", hide_index=True)
+        st.markdown("**5分足デバッグ情報**")
+        st.dataframe(_intraday_fetch_debug_table([signal]), width="stretch", hide_index=True)
+        recent_bars = _intraday_recent_bar_table(signal)
+        if not recent_bars.empty:
+            st.markdown("**直近4本の5分足判定**")
+            st.dataframe(_safe_dataframe(recent_bars), width="stretch", hide_index=True)
         return
 
     cols = st.columns(3)
@@ -1215,9 +1395,10 @@ def _render_intraday_signal(signal: Dict[str, Any], key_prefix: str) -> None:
         f"中期 {format_yen(signal.get('ma_mid'))} / 長期 {format_yen(signal.get('ma_long'))}"
     )
     st.markdown(
-        f"**出来高**：{signal.get('current_volume', 0):,} / "
-        f"平均 {signal.get('volume_avg', 0):,} / 倍率 {signal.get('volume_ratio', '-')}"
+        f"**出来高**：{int(_to_float(signal.get('current_volume'), 0) or 0):,} / "
+        f"平均 {int(_to_float(signal.get('volume_avg'), 0) or 0):,} / 倍率 {signal.get('volume_ratio', '-')}"
     )
+    st.markdown(f"**VWAP**：{format_yen(signal.get('vwap'))} / 終値>VWAP: {signal.get('close_above_vwap', '-')}")
     st.markdown(
         f"**当日レンジ**：高値 {format_yen(signal.get('day_high'))} / "
         f"安値 {format_yen(signal.get('day_low'))} / 安値から {signal.get('rebound_from_day_low_pct', 0)}%"
@@ -1225,6 +1406,11 @@ def _render_intraday_signal(signal: Dict[str, Any], key_prefix: str) -> None:
     st.markdown(f"**RSI**：{signal.get('rsi', '-')}")
 
     _render_judgement_breakdown(signal)
+
+    st.markdown("**5分足デバッグ情報**")
+    st.dataframe(_intraday_fetch_debug_table([signal]), width="stretch", hide_index=True)
+    st.markdown("**直近4本の5分足判定**")
+    st.dataframe(_safe_dataframe(_intraday_recent_bar_table(signal)), width="stretch", hide_index=True)
 
     _render_reason_list("判定理由", signal.get("reasons"))
     _render_reason_list("見送り・警戒理由", signal.get("risk_notes"))
@@ -1382,6 +1568,15 @@ def _render_alerts_log() -> None:
 
 def _render_fetch_test() -> None:
     with st.expander("取得テスト", expanded=False):
+        st.caption("まず主要3銘柄で、yfinanceの5分足がこの環境から取れるか確認できます。")
+        test_cols = st.columns(2)
+        run_three_test = test_cols[0].button("主要3銘柄の5分足単体取得テスト", key="fetch_three_symbols_test_button")
+        three_period = test_cols[1].selectbox("単体取得テストperiod", ["1d", "5d"], index=0, key="fetch_three_symbols_period")
+        if run_three_test:
+            with st.spinner("6501.T / 5803.T / 7011.T の5分足を直接取得中です..."):
+                rows = run_raw_intraday_fetch_test(["6501.T", "5803.T", "7011.T"], period=three_period, interval="5m")
+            st.dataframe(_safe_dataframe(pd.DataFrame(rows)), width="stretch", hide_index=True)
+
         test_code = st.text_input("取得テストコード", value="5803", key="fetch_test_code")
         if not st.button("取得テスト", key="fetch_test_button"):
             return
@@ -1412,6 +1607,9 @@ def _render_fetch_test() -> None:
                         "日足取得行数": daily.fetched_rows,
                         "5分足取得行数": intraday.fetched_rows,
                         "最新Close": latest_close,
+                        "5分足error_type": intraday.error_type,
+                        "5分足latest_5m_jst": intraday.data.index[-1].strftime("%Y-%m-%d %H:%M") if not intraday.data.empty else "-",
+                        "5分足latest_volume": int(intraday.data["Volume"].iloc[-1]) if not intraday.data.empty else "-",
                         "エラー": " / ".join(error_messages) if error_messages else "-",
                     }
                 ]
@@ -1430,15 +1628,69 @@ def _run_intraday_scan(
     if not targets:
         st.session_state.intraday_results = []
         st.session_state.intraday_last_scan_status = "監視対象なし"
+        st.session_state.intraday_last_scan_summary = {
+            "fetch_success_count": 0,
+            "fetch_failed_count": 0,
+            "rows_zero_count": 0,
+            "intraday_ok_positive_count": 0,
+            "latest_5m_jst_max": "-",
+            "scan_elapsed_sec": 0,
+            "cache_used": "なし",
+            "preflight_ok": False,
+        }
         st.warning("監視対象がありません。watchlist.csvまたは手動入力コードを確認してください。")
         return
 
+    started = time.perf_counter()
     with st.spinner(f"{source_label}で5分足データを取得して場中エントリー条件を判定中です..."):
-        st.session_state.intraday_results = scan_intraday_entries(targets, interval=interval, period="5d")
+        preflight_rows = run_raw_intraday_fetch_test(["6501.T", "5803.T", "7011.T"], period="1d", interval=interval)
+        st.session_state.intraday_preflight_rows = preflight_rows
+        preflight_success = [row for row in preflight_rows if int(row.get("rows", 0) or 0) > 0 and not row.get("exception_message")]
+        if not preflight_success:
+            elapsed = round(time.perf_counter() - started, 2)
+            st.session_state.intraday_results = []
+            checked_at = _format_jst(_now_jst())
+            st.session_state.intraday_last_updated = checked_at
+            st.session_state.intraday_last_checked_at = checked_at
+            st.session_state.intraday_last_scan_status = "主要3銘柄の5分足取得に失敗したため停止"
+            st.session_state.intraday_last_scan_summary = {
+                "fetch_success_count": 0,
+                "fetch_failed_count": len(targets),
+                "rows_zero_count": len(targets),
+                "intraday_ok_positive_count": 0,
+                "latest_5m_jst_max": "-",
+                "scan_elapsed_sec": elapsed,
+                "cache_used": "なし",
+                "preflight_ok": False,
+            }
+            st.error("6501.T / 5803.T / 7011.T の5分足取得に失敗しました。yfinance接続、interval指定、ネットワークを確認してください。")
+            st.dataframe(_safe_dataframe(pd.DataFrame(preflight_rows)), width="stretch", hide_index=True)
+            return
+
+        results = scan_intraday_entries(targets, interval=interval, period="5d")
+        elapsed = round(time.perf_counter() - started, 2)
+        success_count = sum(1 for signal in results if signal.get("intraday_fetch_ok"))
+        failed_count = sum(1 for signal in results if not signal.get("intraday_fetch_ok"))
+        rows_zero_count = sum(1 for signal in results if int(signal.get("intraday_rows", signal.get("fetched_rows", 0)) or 0) == 0)
+        intraday_positive_count = sum(1 for signal in results if int(signal.get("intraday_ok_count", signal.get("intraday_score", 0)) or 0) > 0)
+        latest_times = [str(signal.get("latest_5m_jst") or signal.get("last_time") or "") for signal in results]
+        latest_times = [value for value in latest_times if value and value != "-"]
+        cache_used = "あり" if any(signal.get("cache_hit") for signal in results) else "なし"
+        st.session_state.intraday_results = results
         checked_at = _format_jst(_now_jst())
         st.session_state.intraday_last_updated = checked_at
         st.session_state.intraday_last_checked_at = checked_at
         st.session_state.intraday_last_scan_status = f"{len(targets)}銘柄チェック完了"
+        st.session_state.intraday_last_scan_summary = {
+            "fetch_success_count": success_count,
+            "fetch_failed_count": failed_count,
+            "rows_zero_count": rows_zero_count,
+            "intraday_ok_positive_count": intraday_positive_count,
+            "latest_5m_jst_max": max(latest_times) if latest_times else "-",
+            "scan_elapsed_sec": elapsed,
+            "cache_used": cache_used,
+            "preflight_ok": True,
+        }
     _process_intraday_notifications(st.session_state.intraday_results, discord_enabled=discord_enabled)
 
 
@@ -1529,6 +1781,8 @@ def _render_intraday_tab(
         st.session_state.intraday_last_checked_at = "-"
     if "intraday_last_scan_status" not in st.session_state:
         st.session_state.intraday_last_scan_status = "未チェック"
+    if "intraday_last_scan_summary" not in st.session_state:
+        st.session_state.intraday_last_scan_summary = {}
 
     status_cols = st.columns(5)
     status_cols[0].metric("自動監視", "ON" if auto_refresh else "OFF")
@@ -1541,6 +1795,18 @@ def _render_intraday_tab(
         "ブラウザでこのアプリを開いている間だけ動作します。"
     )
     st.caption(f"監視状態：{st.session_state.intraday_last_scan_status}")
+    summary = st.session_state.get("intraday_last_scan_summary", {})
+    summary_cols = st.columns(7)
+    summary_cols[0].metric("5分足取得成功", summary.get("fetch_success_count", 0))
+    summary_cols[1].metric("5分足取得失敗", summary.get("fetch_failed_count", 0))
+    summary_cols[2].metric("rows=0", summary.get("rows_zero_count", 0))
+    summary_cols[3].metric("5分足OK>=1", summary.get("intraday_ok_positive_count", 0))
+    summary_cols[4].metric("最新5分足", summary.get("latest_5m_jst_max", "-"))
+    summary_cols[5].metric("scan elapsed", f"{summary.get('scan_elapsed_sec', 0)}秒")
+    summary_cols[6].metric("cache", summary.get("cache_used", "なし"))
+    if st.session_state.get("intraday_preflight_rows"):
+        with st.expander("主要3銘柄の事前取得テスト結果", expanded=False):
+            st.dataframe(_safe_dataframe(pd.DataFrame(st.session_state.get("intraday_preflight_rows", []))), width="stretch", hide_index=True)
 
     if should_scan:
         _run_intraday_scan(targets, interval=interval, discord_enabled=discord_enabled, source_label="手動更新")
@@ -1571,6 +1837,10 @@ def _render_intraday_tab(
     if results and len(failed) == len(results):
         _render_all_failed_warning(failed)
 
+    if results:
+        with st.expander("5分足取得デバッグ一覧", expanded=False):
+            st.dataframe(_safe_dataframe(_intraday_fetch_debug_table(results)), width="stretch", hide_index=True)
+
     _render_intraday_section("買い検討OK", ok, "intraday_ok")
     _render_intraday_section("監視強化", strong_watch, "intraday_watch")
     _render_intraday_section("見送り", skip, "intraday_skip")
@@ -1589,7 +1859,7 @@ def _render_intraday_tab(
 def _safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    return df.fillna("").astype(str)
+    return df.astype(object).where(pd.notna(df), "").astype(str)
 
 
 def _ai_candidate_table(signals: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -3188,7 +3458,7 @@ def _buy_condition_text(item: Dict[str, Any]) -> str:
     daily_score = item.get("daily_score", condition.get("daily_score"))
     daily_ok = item.get("daily_ok_count", condition.get("daily_ok_count", "-"))
     daily_total_count = item.get("daily_total_count", condition.get("daily_total_count", "-"))
-    intraday_ok = item.get("intraday_ok_count", condition.get("intraday_ok_count", "-"))
+    intraday_ok = item.get("intraday_ok_display") or item.get("intraday_ok_count", condition.get("intraday_ok_count", "-"))
     intraday_total_count = item.get("intraday_total_count", condition.get("intraday_total_count", "-"))
     risk_pass = item.get("risk_pass", condition.get("risk_pass"))
     daily_top_n_pass = item.get("daily_top_n_pass", condition.get("daily_top_n_pass"))
@@ -3206,7 +3476,10 @@ def _buy_condition_text(item: Dict[str, Any]) -> str:
     if daily_score not in (None, ""):
         parts.append(f"日足スコア {_format_score_value(daily_score)}点")
     parts.append(f"日足条件 {daily_ok}/{daily_total_count} OK")
-    parts.append(f"5分足条件 {intraday_ok}/{intraday_total_count} OK")
+    if intraday_ok == "データなし":
+        parts.append("5分足条件 データなし")
+    else:
+        parts.append(f"5分足条件 {intraday_ok}/{intraday_total_count} OK")
     parts.append(f"リスク条件 {_display_risk_pass(risk_pass)}")
     parts.append(f"日足上位N通過 {_display_risk_pass(daily_top_n_pass)}")
     if min_score not in (None, ""):

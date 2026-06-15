@@ -198,16 +198,45 @@ def evaluate_intraday_entry(
 ) -> Dict[str, Any]:
     cfg = normalize_config(config)
     data = _scoped(intraday_df, current_time)
-    if len(data) < max(3, cfg.breakout_lookback_bars + 1):
+    if data.empty:
         return {
-            "vwap_ok": False,
-            "breakout_ok": False,
-            "pullback_rebound_ok": False,
-            "intraday_volume_spike_ok": False,
+            "vwap_ok": None,
+            "breakout_ok": None,
+            "pullback_rebound_ok": None,
+            "intraday_volume_spike_ok": None,
             "intraday_ok_count": 0,
             "intraday_total_count": 4,
-            "intraday_pass": False,
-            "reason": "5分足履歴不足",
+            "intraday_pass": None,
+            "intraday_available": False,
+            "intraday_data_status": "データなし",
+            "current_close": None,
+            "previous_close": None,
+            "vwap": None,
+            "past_n_bars_high": None,
+            "current_volume": None,
+            "avg_volume_12bars": None,
+            "reason": "5分足データが空です",
+            "reasons": [],
+        }
+    if len(data) < max(3, cfg.breakout_lookback_bars + 1):
+        return {
+            "vwap_ok": None,
+            "breakout_ok": None,
+            "pullback_rebound_ok": None,
+            "intraday_volume_spike_ok": None,
+            "intraday_ok_count": 0,
+            "intraday_total_count": 4,
+            "intraday_pass": None,
+            "intraday_available": False,
+            "intraday_data_status": "データ不足",
+            "current_close": None,
+            "previous_close": None,
+            "vwap": None,
+            "past_n_bars_high": None,
+            "current_volume": None,
+            "avg_volume_12bars": None,
+            "reason": f"5分足履歴不足: {len(data)}本",
+            "reasons": [],
         }
 
     data = _with_vwap(data)
@@ -257,6 +286,8 @@ def evaluate_intraday_entry(
         "intraday_ok_count": ok_count,
         "intraday_total_count": 4,
         "intraday_pass": bool(ok_count >= cfg.intraday_min_ok),
+        "intraday_available": True,
+        "intraday_data_status": "取得成功",
         "entry_type": entry_type,
         "current_close": current_close,
         "previous_close": previous_close,
@@ -350,26 +381,31 @@ def evaluate_multi_timeframe_signal(
     daily_filter = evaluate_daily_filter(daily_df, current_time=None, config=cfg)
     intraday_entry = evaluate_intraday_entry(intraday_df, current_time=current_time, config=cfg)
     daily_pass = bool(daily_filter.get("daily_pass"))
-    intraday_pass = bool(intraday_entry.get("intraday_pass"))
+    intraday_available = bool(intraday_entry.get("intraday_available", True))
+    intraday_pass = bool(intraday_entry.get("intraday_pass")) if intraday_available else False
 
     if daily_pass and intraday_pass:
         decision_category = "buy"
     elif daily_pass:
-        decision_category = "watch"
+        decision_category = "unavailable" if not intraday_available else "watch"
     else:
         decision_category = "avoid"
 
+    intraday_ok_count = int(intraday_entry.get("intraday_ok_count") or 0)
+    intraday_total_count = int(intraday_entry.get("intraday_total_count") or 4)
     raw_score = int(
         round(
             daily_filter.get("daily_ok_count", 0) / max(1, daily_filter.get("daily_total_count", 4)) * 50
-            + intraday_entry.get("intraday_ok_count", 0)
-            / max(1, intraday_entry.get("intraday_total_count", 4))
+            + intraday_ok_count
+            / max(1, intraday_total_count)
             * 50
         )
     )
     if decision_category == "buy":
         score = max(70, raw_score)
     elif decision_category == "watch":
+        score = min(69, max(60, raw_score))
+    elif decision_category == "unavailable":
         score = min(69, max(60, raw_score))
     else:
         score = min(59, raw_score)

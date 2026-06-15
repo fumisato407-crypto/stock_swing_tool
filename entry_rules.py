@@ -42,6 +42,12 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 def add_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy().sort_index()
+    typical_price = (out["High"] + out["Low"] + out["Close"]) / 3
+    volume = out["Volume"].fillna(0).clip(lower=0)
+    cumulative_volume = volume.cumsum()
+    cumulative_value = (typical_price * volume).cumsum()
+    fallback_vwap = typical_price.expanding(min_periods=1).mean()
+    out["vwap"] = (cumulative_value / cumulative_volume.replace(0, np.nan)).fillna(fallback_vwap)
     out["ma_short"] = out["Close"].rolling(5, min_periods=1).mean()
     out["ma_mid"] = out["Close"].rolling(10, min_periods=1).mean()
     out["ma_long"] = out["Close"].rolling(20, min_periods=1).mean()
@@ -243,6 +249,7 @@ def evaluate_intraday_entry(
     current_volume = _num(latest["Volume"])
     volume_avg = _num(latest["volume_avg_20"], _num(df["Volume"].tail(20).mean(), 1))
     volume_ratio = current_volume / max(volume_avg, 1)
+    vwap = _num(latest.get("vwap"))
     rsi = _num(latest["rsi_14"], 50)
     rebound_pct = (current / day_low - 1) * 100 if day_low else 0
     level = support_level(current)
@@ -334,6 +341,8 @@ def evaluate_intraday_entry(
         "current_volume": int(current_volume),
         "volume_avg": int(volume_avg),
         "volume_ratio": round(volume_ratio, 2),
+        "vwap": _round_price(vwap),
+        "close_above_vwap": bool(current > vwap) if vwap else False,
         "rsi": round(rsi, 1),
         "rebound_from_day_low_pct": round(rebound_pct, 2),
         "higher_low": higher_low,
